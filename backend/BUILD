@@ -19,11 +19,10 @@ py_library(
     ],
 )
 
-# FastAPI server binary with wrapper
+# FastAPI server binary
 py_binary(
     name = "server",
-    srcs = ["server_wrapper.py", "app.py"],
-    main = "server_wrapper.py",
+    srcs = ["app.py"],
+    main = "app.py",
     deps = [":api"],
-    data = ["app.py"],
 )
