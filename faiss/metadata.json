@@ -1,0 +1,11 @@
+{
+  "index_to_path": [
+    "data/frames/tiny_demo/frame_000000_t0.00s.jpg",
+    "data/frames/tiny_demo/frame_000048_t2.00s.jpg",
+    "data/frames/tiny_demo/frame_000096_t4.00s.jpg",
+    "data/frames/tiny_demo/frame_000144_t6.00s.jpg",
+    "data/frames/tiny_demo/frame_000192_t8.00s.jpg"
+  ],
+  "dimension": 512,
+  "total_vectors": 5
+}
