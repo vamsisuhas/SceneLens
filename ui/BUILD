@@ -5,15 +5,13 @@ package(default_visibility = ["//visibility:public"])
 # Streamlit UI library
 py_library(
     name = "streamlit_app",
-    srcs = ["proto/app.py"],
-# No deps needed - using system packages
+    srcs = ["app.py"],
 )
 
-# Streamlit UI binary with wrapper
+# Streamlit UI binary
 py_binary(
     name = "app",
-    srcs = ["streamlit_wrapper.py"],
-    main = "streamlit_wrapper.py",
+    srcs = ["app.py"],
+    main = "app.py",
     deps = [":streamlit_app"],
-    data = ["proto/app.py"],
 )

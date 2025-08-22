@@ -18,15 +18,3 @@ python_register_toolchains(
     name = "python3_11",
     python_version = "3.11",
 )
-
-load("@rules_python//python:pip.bzl", "pip_parse")
-
-# Create requirements lock file for pip parsing
-pip_parse(
-    name = "pip_deps",
-    python_interpreter_target = "@python3_11_host//:python",
-    requirements_lock = "//:requirements_lock.txt",
-)
-
-load("@pip_deps//:requirements.bzl", "install_deps")
-install_deps()
