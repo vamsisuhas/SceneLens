@@ -1,14 +1,25 @@
-# SceneLens - Video Search with AI
+# SceneLens - AI Video Search System
 
-SceneLens is a video search system that uses CLIP and BLIP models to enable semantic search through video content using natural language queries.
+SceneLens is an intelligent video search system that uses CLIP and BLIP models to enable semantic search through video content using natural language queries.
 
-## Week 1 Setup and Pipeline
+## 🚀 Demo Status
 
-### Prerequisites & Installation
+**Current Demo State:**
+- ✅ Infrastructure: PostgreSQL + MinIO running
+- ✅ Backend API: Running on http://localhost:8000
+- ✅ Frontend UI: Running on http://localhost:8501
+- ✅ Sample Video: Processed with 5 keyframes
+- ✅ Search Index: FAISS with 5 vectors ready
+- ✅ Web Interface: Fully functional with image display
 
-**Fresh Device Setup (Complete Installation Guide):**
+**Quick Access:**
+- **🌐 Web UI**: [http://localhost:8501](http://localhost:8501)
+- **🔧 API Health**: [http://localhost:8000/health](http://localhost:8000/health)
+- **📚 API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
 
-#### 1. **Install System Dependencies**
+## Prerequisites & Installation
+
+### System Dependencies
 
 **macOS:**
 ```bash
@@ -17,10 +28,6 @@ SceneLens is a video search system that uses CLIP and BLIP models to enable sema
 
 # Install required tools
 brew install python@3.11 ffmpeg docker
-
-# Install Bazel 7 (required version)
-brew install bazel@7
-export PATH="/opt/homebrew/opt/bazel@7/bin:$PATH"
 ```
 
 **Ubuntu/Debian:**
@@ -38,73 +45,133 @@ sudo apt install ffmpeg -y
 sudo apt install docker.io docker-compose -y
 sudo systemctl start docker
 sudo usermod -aG docker $USER
-
-# Install Bazel 7
-sudo apt install apt-transport-https curl gnupg -y
-curl -fsSL https://bazel.build/bazel-release.pub.gpg | gpg --dearmor >bazel-archive-keyring.gpg
-sudo mv bazel-archive-keyring.gpg /usr/share/keyrings
-echo "deb [arch=amd64 signed-by=/usr/share/keyrings/bazel-archive-keyring.gpg] https://storage.googleapis.com/bazel-apt stable jdk1.8" | sudo tee /etc/apt/sources.list.d/bazel.list
-sudo apt update && sudo apt install bazel-7.6.1 -y
 ```
 
 **Windows:**
-```bash
-# Install Python 3.11 from python.org
-# Download FFmpeg from https://ffmpeg.org/
-# Install Docker Desktop from docker.com
-# Install Bazelisk from GitHub releases
-# Add all to PATH environment variable
-```
+- Install Python 3.11 from [python.org](https://python.org)
+- Download FFmpeg from [ffmpeg.org](https://ffmpeg.org/)
+- Install Docker Desktop from [docker.com](https://docker.com)
 
-#### 2. **Clone & Setup Project**
+### Project Setup
+
 ```bash
 # Clone the repository
 git clone https://github.com/vamsisuhas/SceneLens.git
 cd SceneLens
 
-# Make Bazel 7 permanent (add to ~/.bashrc or ~/.zshrc)
-echo 'export PATH="/opt/homebrew/opt/bazel@7/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-### Quick Start (Clean Bazel Architecture)
-
-**One-Time Setup:**
-```bash
-# 1. Set Bazel 7 PATH (add to ~/.zshrc to make permanent)
-export PATH="/opt/homebrew/opt/bazel@7/bin:$PATH"
-
-# 2. Install Python packages (one-time only)
+# Install Python dependencies
 pip install -r requirements.txt
 
-# 3. Start infrastructure services  
+# Fix NumPy compatibility (if needed)
+pip install 'numpy<2.0'
+
+```
+
+## Quick Start
+
+### 1. Start Infrastructure
+```bash
 cd infra && docker-compose up -d && cd ..
 ```
 
-**Run SceneLens:**
+### 2. Start Backend API
 ```bash
-# Set Bazel PATH (if not permanent)
-export PATH="/opt/homebrew/opt/bazel@7/bin:$PATH"
+# Method 1: Direct Python (background)
+uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload &
 
-# Start backend API
-bazel run //backend:server &
+# Method 2: Python script (alternative)
+python backend/app.py &
+
 # ✅ API: http://localhost:8000
-
-# Start Streamlit UI  
-bazel run //ui:app
-# ✅ UI: http://localhost:8501
-
-# Run complete pipeline (optional)
-bazel run //:pipeline -- data/videos/tiny_demo.mp4
+# ✅ Health Check: http://localhost:8000/health
 ```
 
-**Quick Demo:**
+### 3. Start Frontend UI
 ```bash
-# Start services and test with sample video
-bazel run //backend:server &
-bazel run //ui:app &
-bazel run //:pipeline -- data/videos/tiny_demo.mp4
-
-# Open browser: http://localhost:8501
-# Search for: "pink sky" or "water"
+streamlit run ui/app.py --server.port 8501 &
+# ✅ UI: http://localhost:8501
+# ✅ Open in browser: open http://localhost:8501
 ```
+
+### 4. Process Video (Optional)
+```bash
+# Run complete pipeline to process a video
+python run_pipeline.py data/videos/your_video.mp4
+```
+
+## Complete Demo (Recommended)
+
+```bash
+# 1. Start infrastructure services
+cd infra && docker-compose up -d && cd ..
+
+# 2. Create and process sample video
+mkdir -p data/videos data/frames artifacts faiss
+ffmpeg -f lavfi -i testsrc=duration=10:size=320x240:rate=1 -pix_fmt yuv420p data/videos/demo.mp4 -y
+python run_pipeline.py data/videos/demo.mp4
+
+# 3. Start backend API (choose one method)
+uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload &
+# OR: python backend/app.py &
+
+# 4. Start frontend UI  
+streamlit run ui/app.py --server.port 8501 &
+
+# 5. Open browser and search
+open http://localhost:8501
+
+# ✅ Try these searches:
+# - "colorful circle"
+# - "black background"
+# - "geometric patterns"
+# - "bright colors"
+```
+
+## API Endpoints
+
+- **Health Check**: `GET http://localhost:8000/health`
+- **Semantic Search**: `GET http://localhost:8000/search?q=query&top_k=10`
+- **Caption Search**: `GET http://localhost:8000/search/caption?q=query&top_k=10`
+
+### Example API Usage
+
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# Semantic search
+curl "http://localhost:8000/search?q=colorful+circle&top_k=5"
+
+# Caption search  
+curl "http://localhost:8000/search/caption?q=circle&top_k=3"
+```
+
+## Architecture
+
+```
+SceneLens/
+├── backend/          # FastAPI backend server
+│   ├── app.py       # Main API application
+│   └── search.py    # Search engine logic
+├── ui/              # Streamlit frontend
+│   └── app.py       # Web interface
+├── pipeline/        # Video processing pipeline
+│   ├── ingest.py    # Video ingestion
+│   ├── keyframe.py  # Frame extraction
+│   ├── captions.py  # AI caption generation
+│   ├── vision_embed.py # CLIP embeddings
+│   └── fuse_index.py   # Search index creation
+├── infra/           # Infrastructure
+│   └── docker-compose.yml # PostgreSQL + MinIO
+└── requirements.txt # Python dependencies
+```
+
+## Features
+
+- 🎬 **Video Processing**: Automatic keyframe extraction and analysis
+- 🧠 **AI Models**: CLIP for vision, BLIP for captions
+- 🔍 **Semantic Search**: Natural language video search
+- 🖼️ **Visual Interface**: Clean Streamlit web UI
+- 🚀 **Fast API**: RESTful backend with FastAPI
+- 📊 **Vector Search**: FAISS-powered similarity search
+- 🗄️ **Data Storage**: PostgreSQL + MinIO object storage

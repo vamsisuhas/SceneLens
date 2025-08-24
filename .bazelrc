@@ -1,7 +1,0 @@
-# Enable WORKSPACE mode
-common --noenable_bzlmod
-common --enable_workspace
-
-# Python environment
-build --action_env=PATH
-build --action_env=PYTHONPATH
