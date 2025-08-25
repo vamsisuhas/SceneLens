@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Caption generation script using BLIP-2."""
+"""Caption generation script using BLIP."""
 
 import os
 import sys
@@ -101,7 +101,7 @@ def generate_captions_for_frames(frames_dir, output_file="artifacts/captions.jso
                 result = {
                     "image_path": rel_path,
                     "caption": caption,
-                    "confidence": 1.0  # BLIP-2 doesn't provide confidence scores
+                    "confidence": 1.0  # BLIP doesn't provide confidence scores
                 }
                 results.append(result)
                 

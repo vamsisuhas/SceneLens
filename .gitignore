@@ -31,12 +31,6 @@ ENV/
 env.bak/
 venv.bak/
 
-# Bazel
-bazel-*
-.bazel/
-.bazelrc.user
-.bazelversion
-
 # IDEs
 .idea/
 .vscode/
@@ -44,16 +38,7 @@ bazel-*
 *.swo
 *~
 
-# OS
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Project specific
+# Project specific - Local data (now stored in MinIO)
 data/
 artifacts/
 keyframes/
@@ -68,13 +53,21 @@ keyframes/
 *.temp
 *.log
 
-# Model downloads
+# Model downloads (cached by transformers)
 models/
 checkpoints/
 
-# Database
+# Database (using PostgreSQL, not SQLite)
 *.db
 *.sqlite3
 
-# MinIO data
+# MinIO data (Docker volumes)
 minio-data/
+
+# FAISS index files (can be regenerated)
+faiss/*.index
+faiss/*.faiss
+
+# Pipeline temporary files
+/tmp/
+temp/
