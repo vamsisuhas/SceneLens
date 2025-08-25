@@ -7,6 +7,8 @@ from typing import List, Optional
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
+from minio import Minio
+from minio.error import S3Error
 
 import sys
 import os
@@ -23,25 +25,29 @@ class SearchEngine:
                  metadata_path="faiss/metadata.json",
                  model_name="clip-ViT-B-32"):
         """Initialize the search engine."""
+        # Keep file paths only for backward compatibility, but do not write to them
         self.faiss_index_path = Path(faiss_index_path)
         self.metadata_path = Path(metadata_path)
+
+        # Initialize MinIO client (matches rest of project)
+        self.minio_client = Minio(
+            "localhost:9000",
+            access_key="scenelens",
+            secret_key="scenelens_dev123",
+            secure=False,
+        )
+        self.bucket_name = "scenelens"
+
+        # Always load FAISS index and metadata directly from MinIO into memory
+        self._load_faiss_from_minio()
         
-        # Load FAISS index
-        if self.faiss_index_path.exists():
-            self.index = faiss.read_index(str(self.faiss_index_path))
-            print(f"Loaded FAISS index with {self.index.ntotal} vectors")
-        else:
+        # If MinIO load failed, fall back to empty state
+        if not hasattr(self, "index") or self.index is None:
             self.index = None
-            print(f"FAISS index not found: {self.faiss_index_path}")
-        
-        # Load metadata
-        if self.metadata_path.exists():
-            with open(self.metadata_path, "r") as f:
-                self.metadata = json.load(f)
-            print(f"Loaded metadata for {len(self.metadata['index_to_path'])} items")
-        else:
+            print("FAISS index not loaded from MinIO")
+        if not hasattr(self, "metadata") or not self.metadata:
             self.metadata = {"index_to_path": []}
-            print(f" Metadata not found: {self.metadata_path}")
+            print("Metadata not loaded from MinIO")
         
         # Load text encoder
         try:
@@ -50,6 +56,47 @@ class SearchEngine:
         except Exception as e:
             print(f"Failed to load text encoder: {e}")
             self.text_encoder = None
+
+    def _load_faiss_from_minio(self):
+        """Load FAISS index and metadata directly from MinIO into memory (no local files)."""
+        try:
+            objects = self.minio_client.list_objects(self.bucket_name, prefix="faiss/", recursive=True)
+            latest_index = None
+            latest_meta = None
+            for obj in objects:
+                name = obj.object_name
+                if name.endswith("_index.faiss") or name.endswith("keyframes.index"):
+                    if latest_index is None or obj.last_modified > latest_index.last_modified:
+                        latest_index = obj
+                elif name.endswith("_metadata.json") or name.endswith("metadata.json"):
+                    if latest_meta is None or obj.last_modified > latest_meta.last_modified:
+                        latest_meta = obj
+
+            if latest_index is not None:
+                data = self.minio_client.get_object(self.bucket_name, latest_index.object_name).read()
+                import numpy as _np
+                self.index = faiss.deserialize_index(_np.frombuffer(data, dtype=_np.uint8))
+                print(f"Loaded FAISS index from MinIO: {latest_index.object_name}")
+            else:
+                self.index = None
+                print("No FAISS index found in MinIO")
+
+            if latest_meta is not None:
+                meta_bytes = self.minio_client.get_object(self.bucket_name, latest_meta.object_name).read()
+                self.metadata = json.loads(meta_bytes.decode("utf-8"))
+                print(f"Loaded FAISS metadata from MinIO: {latest_meta.object_name}")
+            else:
+                self.metadata = {"index_to_path": []}
+                print("No FAISS metadata found in MinIO")
+
+        except S3Error as e:
+            print(f"MinIO error while fetching FAISS files: {e}")
+            self.index = None
+            self.metadata = {"index_to_path": []}
+        except Exception as e:
+            print(f"Unexpected error loading FAISS from MinIO: {e}")
+            self.index = None
+            self.metadata = {"index_to_path": []}
     
     def search(self, query: str, top_k: int = 10) -> List[dict]:
         """Search for frames matching the text query."""
