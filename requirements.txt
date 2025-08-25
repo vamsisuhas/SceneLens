@@ -13,3 +13,6 @@ tqdm>=4.64.0
 pillow>=9.0.0
 pandas>=2.0.0
 streamlit>=1.25.0
+minio>=7.1.0
+python-multipart>=0.0.6
+numpy<2.0,>=1.22
