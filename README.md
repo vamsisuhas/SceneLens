@@ -5,17 +5,16 @@ SceneLens is an intelligent video search system that uses CLIP and BLIP models t
 ## 🚀 Demo Status
 
 **Current Demo State:**
-- ✅ Infrastructure: PostgreSQL + MinIO running
-- ✅ Backend API: Running on http://localhost:8000
-- ✅ Frontend UI: Running on http://localhost:8501
-- ✅ Sample Video: Processed with 5 keyframes
-- ✅ Search Index: FAISS with 5 vectors ready
-- ✅ Web Interface: Fully functional with image display
+- Infrastructure: PostgreSQL + MinIO running
+- Backend API: Running on http://localhost:8000
+- Frontend UI: Running on http://localhost:8501
+- Sample Video: Processed with 5 keyframes
+- Search Index: FAISS with 5 vectors ready
+- Web Interface: Fully functional with image display
 
 **Quick Access:**
-- **🌐 Web UI**: [http://localhost:8501](http://localhost:8501)
-- **🔧 API Health**: [http://localhost:8000/health](http://localhost:8000/health)
-- **📚 API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Web UI**: [http://localhost:8501](http://localhost:8501)
+- **API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ## Prerequisites & Installation
 
@@ -62,9 +61,6 @@ cd SceneLens
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Fix NumPy compatibility (if needed)
-pip install 'numpy<2.0'
-
 ```
 
 ## Quick Start
@@ -76,12 +72,7 @@ cd infra && docker-compose up -d && cd ..
 
 ### 2. Start Backend API
 ```bash
-# Method 1: Direct Python (background)
-uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload &
-
-# Method 2: Python script (alternative)
 python backend/app.py &
-
 # ✅ API: http://localhost:8000
 # ✅ Health Check: http://localhost:8000/health
 ```
@@ -93,10 +84,10 @@ streamlit run ui/app.py --server.port 8501 &
 # ✅ Open in browser: open http://localhost:8501
 ```
 
-### 4. Process Video (Optional)
+### 4. Process Video
 ```bash
 # Run complete pipeline to process a video
-python run_pipeline.py data/videos/your_video.mp4
+python run_pipeline.py <video_name>
 ```
 
 ## Complete Demo (Recommended)
