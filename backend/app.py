@@ -5,9 +5,10 @@ import os
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import uvicorn
+from minio.error import S3Error
 
 import sys
 import os
@@ -77,8 +78,6 @@ async def root():
             "search": "/search?q=<query>&top_k=<number>",
             "search_caption": "/search/caption?q=<query>&top_k=<number>",
             "database_info": "/database",
-            "storage_info": "/storage", 
-            "system_info": "/system",
             "upload_video": "/upload-video/",
             "health": "/health",
             "docs": "/docs",
@@ -128,17 +127,54 @@ async def search_caption(
 
 @app.get("/image/{path:path}")
 async def get_image(path: str):
-    """Serve image files (keyframes)."""
+    """Serve image files (keyframes) from MinIO."""
     try:
-        # Security: ensure path is within allowed directories
-        allowed_dirs = ["data/frames", "artifacts"]
-        if not any(path.startswith(d) for d in allowed_dirs):
+        
+        # Security: ensure path is within allowed directories or contains frames
+        allowed_dirs = ["data/frames", "frames", "artifacts"]
+        if not any(path.startswith(d) for d in allowed_dirs) and "frames/" not in path:
             raise HTTPException(status_code=403, detail="Access denied")
         
-        if not os.path.exists(path):
-            raise HTTPException(status_code=404, detail="Image not found")
-        
-        return FileResponse(path)
+        # Try to get image from MinIO first
+        try:
+            # Convert various path formats to MinIO object path
+            # Handle temporary paths like "/var/folders/.../frames/demo/demo/frame_000000_t0.00s.jpg"
+            # and convert to "frames/demo/frame_000000_t0.00s.jpg"
+            if "frames/" in path:
+                # Extract the frames/... part from the path
+                frames_index = path.find("frames/")
+                minio_path = path[frames_index:]
+                # Remove duplicate folder names if present (e.g., /video_name/video_name/ -> /video_name/)
+                # Extract video name from path and fix duplicates
+                path_parts = minio_path.split('/')
+                if len(path_parts) >= 3 and path_parts[1] == path_parts[2]:
+                    # Remove duplicate folder: frames/video_name/video_name/file.jpg -> frames/video_name/file.jpg
+                    minio_path = '/'.join([path_parts[0]] + path_parts[2:])
+            else:
+                # Convert local path to MinIO object path
+                # e.g., "data/frames/demo/frame_000000_t0.00s.jpg" -> "frames/demo/frame_000000_t0.00s.jpg"
+                minio_path = path.replace("data/", "")
+            
+            # Get image from MinIO
+            image_data = minio_client.get_object(bucket_name, minio_path).read()
+            
+            # Determine content type based on file extension
+            if path.endswith('.jpg') or path.endswith('.jpeg'):
+                content_type = "image/jpeg"
+            elif path.endswith('.png'):
+                content_type = "image/png"
+            else:
+                content_type = "image/jpeg"  # default
+            
+            return Response(content=image_data, media_type=content_type)
+            
+        except S3Error as e:
+            # If not found in MinIO, try local file as fallback
+            if os.path.exists(path):
+                return FileResponse(path)
+            else:
+                raise HTTPException(status_code=404, detail=f"Image not found in MinIO or locally: {path}")
+                
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to serve image: {str(e)}")
 

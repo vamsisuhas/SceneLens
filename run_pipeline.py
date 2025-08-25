@@ -95,7 +95,22 @@ def main():
         for script, script_args, description in steps:
             if run_step(script, script_args, description):
                 # Upload generated artifacts to MinIO
-                if "Caption Generation" in description:
+                if "Keyframe Extraction" in description:
+                    # Upload frames to MinIO
+                    frames_uploaded = 0
+                    # Handle nested directory structure created by keyframe extraction
+                    actual_frames_dir = frames_dir
+                    if os.path.exists(os.path.join(frames_dir, video_stem)):
+                        actual_frames_dir = os.path.join(frames_dir, video_stem)
+                    
+                    for frame_file in os.listdir(actual_frames_dir):
+                        if frame_file.endswith(('.jpg', '.jpeg', '.png')):
+                            local_frame_path = os.path.join(actual_frames_dir, frame_file)
+                            minio_frame_path = f"frames/{video_stem}/{frame_file}"
+                            minio_client.fput_object(bucket_name, minio_frame_path, local_frame_path)
+                            frames_uploaded += 1
+                    print(f"📤 Uploaded {frames_uploaded} frames to MinIO")
+                elif "Caption Generation" in description:
                     minio_client.fput_object(bucket_name, f"artifacts/{video_stem}_captions.json", temp_captions_file)
                     print(f"📤 Uploaded captions to MinIO")
                 elif "Vision Embeddings" in description:

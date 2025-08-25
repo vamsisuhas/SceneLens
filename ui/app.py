@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 import streamlit as st
 import requests
 import json
+import io
 from PIL import Image
 from pathlib import Path
 
@@ -185,12 +186,19 @@ def display_results(data, api_base_url):
 def display_result_card(result, container, api_base_url):
     """Display a single result card."""
     with container:
-        # Try to display image
+        # Try to display image from API
         image_path = result.get("keyframe_path")
-        if image_path and os.path.exists(image_path):
+        if image_path:
             try:
-                image = Image.open(image_path)
-                st.image(image, use_column_width=True)
+                # Fetch image from backend API
+                image_url = f"{api_base_url}/image/{image_path}"
+                response = requests.get(image_url, timeout=10)
+                if response.status_code == 200:
+                    # Convert bytes to PIL Image
+                    image = Image.open(io.BytesIO(response.content))
+                    st.image(image, use_column_width=True)
+                else:
+                    st.error(f"Failed to load image: {response.status_code}")
             except Exception as e:
                 st.error(f"Could not load image: {e}")
         else:
