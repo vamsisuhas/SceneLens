@@ -39,10 +39,53 @@ def run_step(script, args, description):
     print(f"✅ Success: {description}")
     return True
 
+def test_on_demand_search(video_name):
+    """Test on-demand search functionality."""
+    print(f"\n🔍 Testing On-Demand Search")
+    print("=" * 60)
+    
+    try:
+        import requests
+        
+        # Test basic on-demand search
+        test_queries = [
+            "colorful circle",
+            "black background", 
+            "geometric pattern"
+        ]
+        
+        for query in test_queries:
+            print(f"Testing query: '{query}'")
+            response = requests.get(
+                "http://localhost:8000/search/on-demand",
+                params={"q": query, "top_k": 3},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                print(f"  ✅ Found {data['total_results']} results")
+                print(f"  📊 Search type: {data['search_type']}")
+                
+                # Show first result details
+                if data['results']:
+                    first_result = data['results'][0]
+                    print(f"  🎯 Top result: {first_result['video_filename']} at {first_result['timestamp_seconds']:.1f}s")
+            else:
+                print(f"  ❌ Failed: {response.status_code}")
+                
+    except Exception as e:
+        print(f"❌ On-demand search test failed: {e}")
+        return False
+    
+    print("✅ On-demand search test completed")
+    return True
+
 def main():
     parser = argparse.ArgumentParser(description="Run complete SceneLens pipeline")
     parser.add_argument("video", help="Input video file")
     parser.add_argument("--interval", default="2", help="Keyframe interval in seconds")
+    parser.add_argument("--test-on-demand", action="store_true", help="Test on-demand search after processing")
     
     args = parser.parse_args()
     
@@ -134,10 +177,18 @@ def main():
         if success:
             print("\n🎉 PIPELINE COMPLETE!")
             print("🧹 Temporary files automatically cleaned up")
+            
+            # Test on-demand search if requested
+            if args.test_on_demand:
+                test_on_demand_search(video_name)
+            
             print("\nStart services:")
             print("  API: uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload")
             print("  UI:  streamlit run ui/app.py --server.port 8501")
             print("\nOpen: http://localhost:8501")
+            print("\n🔍 Try on-demand search:")
+            print("  - Select 'On-demand' search type in the UI")
+            print("  - Or use API: curl 'http://localhost:8000/search/on-demand?q=your_query&top_k=10'")
         else:
             print("\n❌ Pipeline failed!")
             sys.exit(1)

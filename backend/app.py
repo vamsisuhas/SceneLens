@@ -2,10 +2,11 @@
 """FastAPI application for SceneLens search API."""
 
 import os
+import logging
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 from minio.error import S3Error
@@ -16,6 +17,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.search import get_search_engine
 from minio import Minio
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize MinIO client
 minio_client = Minio(
@@ -39,9 +44,12 @@ class SearchResult(BaseModel):
     video_title: Optional[str]
     frame_number: int
     timestamp_seconds: float
+    segment_start_seconds: Optional[float] = None
+    segment_end_seconds: Optional[float] = None
     keyframe_path: str
     caption: Optional[str]
     score: float
+    is_on_demand: Optional[bool] = False
 
 
 class SearchResponse(BaseModel):
@@ -72,11 +80,11 @@ app.add_middleware(
 async def root():
     """Root endpoint with API information."""
     return {
-        "message": "SceneLens Search API",
+        "message": "SceneLens Query-Based Search API",
         "version": "1.0.0",
         "endpoints": {
             "search": "/search?q=<query>&top_k=<number>",
-            "search_caption": "/search/caption?q=<query>&top_k=<number>",
+            "search_on_demand": "/search/on-demand?q=<query>&top_k=<number>&frame_interval=<seconds>",
             "database_info": "/database",
             "upload_video": "/upload-video/",
             "health": "/health",
@@ -90,39 +98,148 @@ async def search(
     q: str = Query(..., description="Search query text"),
     top_k: int = Query(10, description="Number of results to return", ge=1, le=100)
 ):
-    """Semantic search endpoint using CLIP embeddings."""
+    """Query-based search endpoint using prompt-driven frame extraction."""
     try:
         search_engine = get_search_engine()
-        results = search_engine.search(q, top_k)
+        results = search_engine.search_on_demand(q, top_k)
         
         return SearchResponse(
             query=q,
             results=[SearchResult(**result) for result in results],
             total_results=len(results),
-            search_type="semantic"
+            search_type="query_based"
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
-@app.get("/search/caption", response_model=SearchResponse)
-async def search_caption(
+@app.get("/search/on-demand", response_model=SearchResponse)
+async def search_on_demand(
     q: str = Query(..., description="Search query text"),
-    top_k: int = Query(10, description="Number of results to return", ge=1, le=100)
+    top_k: int = Query(10, description="Number of results to return", ge=1, le=50),
+    frame_interval: float = Query(1.0, description="Frame extraction interval in seconds", ge=0.1, le=2.0),
+    use_existing_first: bool = Query(True, description="Search existing keyframes first")
 ):
-    """Text search endpoint using caption matching."""
+    """On-demand search endpoint using dynamic frame extraction."""
     try:
         search_engine = get_search_engine()
-        results = search_engine.search_by_caption(q, top_k)
+        results = search_engine.search_on_demand(
+            q, top_k, frame_interval, use_existing_first
+        )
         
         return SearchResponse(
             query=q,
             results=[SearchResult(**result) for result in results],
             total_results=len(results),
-            search_type="caption"
+            search_type="on_demand"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"On-demand search failed: {str(e)}")
+
+
+@app.get("/video/{video_id}/segments")
+async def get_video_segments(video_id: str):
+    """Get all segments for a video with timeline data."""
+    try:
+        from pipeline.database import get_db_session
+        from pipeline.models import Video, Segment
+        
+        db = get_db_session()
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get all segments and deduplicate by timestamp
+        all_segments = db.query(Segment).filter(
+            Segment.video_id == video_id
+        ).order_by(Segment.timestamp_seconds).all()
+        
+        # Deduplicate segments by timestamp (keep the first one at each timestamp)
+        unique_segments = []
+        seen_timestamps = set()
+        
+        for segment in all_segments:
+            if segment.timestamp_seconds not in seen_timestamps:
+                unique_segments.append(segment)
+                seen_timestamps.add(segment.timestamp_seconds)
+        
+        logger.info(f"Found {len(all_segments)} total segments, deduplicated to {len(unique_segments)} unique segments")
+        
+        # Calculate segment boundaries
+        video_segments = []
+        for i, segment in enumerate(unique_segments):
+            # Calculate end time (next segment start or video end)
+            if i < len(unique_segments) - 1:
+                segment_end = unique_segments[i + 1].timestamp_seconds
+            else:
+                segment_end = segment.timestamp_seconds + 2.0  # Default duration
+            
+            video_segments.append({
+                "segment_id": str(segment.id),
+                "timestamp_seconds": segment.timestamp_seconds,
+                "start_seconds": segment.timestamp_seconds,
+                "end_seconds": segment_end,
+                "duration_seconds": segment_end - segment.timestamp_seconds,
+                "keyframe_path": segment.keyframe_path,
+                "caption": segment.caption,
+                "frame_number": segment.frame_number
+            })
+        
+        return {
+            "video_id": video_id,
+            "video_filename": video.filename,
+            "video_title": video.title,
+            "duration_seconds": video.duration_seconds,
+            "segments": video_segments,
+            "total_segments": len(video_segments),
+            "original_segments": len(all_segments)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting video segments: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get video segments: {str(e)}")
+    finally:
+        db.close()
+
+
+@app.get("/video/{video_id}/file")
+async def get_video_file(video_id: str):
+    """Get video file for playback."""
+    try:
+        from pipeline.database import get_db_session
+        from pipeline.models import Video
+        from fastapi.responses import StreamingResponse
+        import io
+        
+        db = get_db_session()
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        try:
+            # Get video data from MinIO
+            video_data = minio_client.get_object(bucket_name, f"videos/{video.filename}")
+            video_bytes = video_data.read()
+            
+            # Return video as streaming response
+            return StreamingResponse(
+                io.BytesIO(video_bytes),
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": f"inline; filename={video.filename}",
+                    "Accept-Ranges": "bytes"
+                }
+            )
+                
+        except Exception as e:
+            logger.error(f"Error serving video file: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to serve video: {str(e)}")
+                    
+    except Exception as e:
+        logger.error(f"Error getting video file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get video file: {str(e)}")
+    finally:
+        db.close()
 
 
 @app.get("/image/{path:path}")
@@ -132,7 +249,7 @@ async def get_image(path: str):
         
         # Security: ensure path is within allowed directories or contains frames
         allowed_dirs = ["data/frames", "frames", "artifacts"]
-        if not any(path.startswith(d) for d in allowed_dirs) and "frames/" not in path:
+        if not any(path.startswith(d) for d in allowed_dirs) and "frames/" not in path and "query_extracted/" not in path:
             raise HTTPException(status_code=403, detail="Access denied")
         
         # Try to get image from MinIO first
@@ -285,9 +402,9 @@ def upload_image_to_minio(file_path, object_name):
         minio_client.fput_object(
             bucket_name, object_name, file_path
         )
-        print(f"Image {object_name} uploaded successfully.")
+        logger.info(f"Image {object_name} uploaded successfully.")
     except Exception as e:
-        print(f"Error uploading image: {e}")
+        logger.error(f"Error uploading image: {e}")
 
 
 def get_image_from_minio(object_name, download_path):
@@ -296,9 +413,9 @@ def get_image_from_minio(object_name, download_path):
         minio_client.fget_object(
             bucket_name, object_name, download_path
         )
-        print(f"Image {object_name} downloaded successfully to {download_path}.")
+        logger.info(f"Image {object_name} downloaded successfully to {download_path}.")
     except Exception as e:
-        print(f"Error downloading image: {e}")
+        logger.error(f"Error downloading image: {e}")
 
 def main():
     """Main entry point for running the server."""
