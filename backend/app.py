@@ -137,6 +137,36 @@ async def search_on_demand(
         raise HTTPException(status_code=500, detail=f"On-demand search failed: {str(e)}")
 
 
+@app.get("/search/video/{video_id}", response_model=SearchResponse)
+async def search_specific_video(
+    video_id: str,
+    q: str = Query(..., description="Search query text"),
+    top_k: int = Query(10, description="Number of results to return", ge=1, le=50),
+    frame_interval: float = Query(0.1, description="Frame extraction interval in seconds", ge=0.1, le=2.0)
+):
+    """Search within a specific video only."""
+    try:
+        search_engine = get_search_engine()
+        
+        # Perform search with video_id filter
+        results = search_engine.search_specific_video(
+            query=q,
+            video_id=video_id,
+            top_k=top_k,
+            frame_interval=frame_interval
+        )
+        
+        return SearchResponse(
+            query=q,
+            results=results,
+            total_results=len(results),
+            search_type="video_specific"
+        )
+    except Exception as e:
+        logger.error(f"Video-specific search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Video search failed: {str(e)}")
+
+
 @app.get("/video/{video_id}/segments")
 async def get_video_segments(video_id: str):
     """Get all segments for a video with timeline data."""
@@ -307,9 +337,88 @@ async def upload_video(file: UploadFile = File(...)):
 
         # Upload to MinIO
         minio_client.fput_object(bucket_name, f"videos/{file.filename}", file_location)
-        return {"message": f"Uploaded {file.filename} to MinIO."}
+        
+        # Clean up temp file
+        os.remove(file_location)
+        
+        return {"message": f"Uploaded {file.filename} to MinIO.", "filename": file.filename}
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Error uploading video: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+@app.post("/process-video/")
+async def process_video(request: dict):
+    """Ultra-lightweight video processing - just store basic metadata."""
+    try:
+        filename = request.get("filename")
+        if not filename:
+            raise HTTPException(status_code=400, detail="Filename is required")
+        
+        # Import database functions
+        import sys
+        import os
+        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        
+        from pipeline.database import get_db_session
+        from pipeline.models import Video
+        from datetime import datetime
+        
+        logger.info(f"Storing video metadata: {filename}")
+        
+        # Get MinIO object info without downloading
+        video_path = f"videos/{filename}"
+        
+        try:
+            # Get object stats from MinIO (no download needed)
+            obj_stat = minio_client.stat_object(bucket_name, video_path)
+            file_size = obj_stat.size
+            
+            # Store in database with minimal metadata
+            db = get_db_session()
+            
+            # Check if video already exists
+            existing_video = db.query(Video).filter(Video.filename == filename).first()
+            if existing_video:
+                video_id = existing_video.id
+                logger.info(f"Video already exists with ID: {video_id}")
+            else:
+                # Create new video record with basic info
+                video = Video(
+                    filename=filename,
+                    title=filename.split('.')[0],  # Use filename without extension as title
+                    duration_seconds=0,  # Will be determined during search
+                    fps=0,  # Will be determined during search
+                    width=0,  # Will be determined during search
+                    height=0,  # Will be determined during search
+                    file_size_bytes=file_size,
+                    created_at=datetime.utcnow(),
+                    minio_path=video_path
+                )
+                
+                db.add(video)
+                db.commit()
+                video_id = video.id
+                logger.info(f"Created new video record with ID: {video_id}")
+            
+            db.close()
+            
+            return {
+                "message": f"Video {filename} uploaded successfully!",
+                "video_id": video_id,
+                "filename": filename,
+                "file_size": file_size,
+                "status": "ready_for_search",
+                "note": "Video stored - processing will happen on first search"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting video info: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to process video: {str(e)}")
+            
+    except Exception as e:
+        logger.error(f"Error processing video: {e}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 
 @app.get("/health")
@@ -318,10 +427,49 @@ async def health_check():
     search_engine = get_search_engine()
     return {
         "status": "healthy",
-        "faiss_loaded": search_engine.index is not None,
         "text_encoder_loaded": search_engine.text_encoder is not None,
-        "total_vectors": search_engine.index.ntotal if search_engine.index else 0,
+        "on_demand_extractor_loaded": search_engine.on_demand_extractor is not None,
+        "search_type": "prompt_driven"
     }
+
+
+@app.get("/check-minio-videos")
+async def check_minio_videos():
+    """Check which videos are actually available in MinIO."""
+    try:
+        from pipeline.database import get_db_session
+        from pipeline.models import Video
+        
+        db = get_db_session()
+        all_videos = db.query(Video).all()
+        
+        video_status = []
+        for video in all_videos:
+            try:
+                # Try to get object info from MinIO
+                video_path = f"videos/{video.filename}"
+                obj_stat = minio_client.stat_object(bucket_name, video_path)
+                status = "available"
+                minio_size = obj_stat.size
+            except Exception as e:
+                status = f"missing: {str(e)}"
+                minio_size = 0
+            
+            video_status.append({
+                "id": str(video.id),
+                "filename": video.filename,
+                "db_size": video.file_size_bytes,
+                "minio_size": minio_size,
+                "status": status,
+                "minio_path": f"videos/{video.filename}"
+            })
+        
+        db.close()
+        return {"videos": video_status}
+        
+    except Exception as e:
+        logger.error(f"Error checking MinIO videos: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to check videos: {str(e)}")
 
 
 @app.get("/database")

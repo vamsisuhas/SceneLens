@@ -76,6 +76,112 @@ def check_health(api_base_url):
         st.sidebar.error(f"❌ Could not connect to API: {e}")
         return False
 
+def upload_and_store_video(uploaded_file, api_base_url):
+    """Upload video and store metadata (no heavy processing)."""
+    
+    # Initialize progress tracking
+    if 'upload_progress' not in st.session_state:
+        st.session_state.upload_progress = 0
+    
+    # Create progress placeholders
+    progress_placeholder = st.empty()
+    status_placeholder = st.empty()
+    
+    try:
+        # Step 1: Start upload
+        st.session_state.processing_status = "uploading"
+        st.session_state.upload_start_time = time.time()
+        st.session_state.upload_progress = 10
+        
+        file_size_mb = uploaded_file.size / (1024*1024)
+        
+        with progress_placeholder.container():
+            st.progress(0.1)
+            status_placeholder.info(f"📤 Starting upload of {file_size_mb:.1f}MB file...")
+        
+        # Step 2: Prepare upload
+        files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+        upload_timeout = max(300, int(file_size_mb * 5))  # 5 seconds per MB, minimum 5 minutes
+        
+        st.session_state.upload_progress = 30
+        with progress_placeholder.container():
+            st.progress(0.3)
+            status_placeholder.info(f"📤 Uploading {file_size_mb:.1f}MB to server...")
+        
+        # Step 3: Upload to backend
+        response = requests.post(
+            f"{api_base_url}/upload-video/", 
+            files=files,
+            timeout=upload_timeout
+        )
+        
+        if response.status_code != 200:
+            st.session_state.processing_status = "error"
+            st.session_state.error_message = f"Upload failed: {response.text}"
+            with progress_placeholder.container():
+                st.error(f"❌ Upload failed: {response.text}")
+            return
+        
+        # Step 4: Upload completed
+        upload_time = time.time() - st.session_state.upload_start_time
+        st.session_state.upload_progress = 70
+        
+        with progress_placeholder.container():
+            st.progress(0.7)
+            status_placeholder.success(f"✅ Upload completed in {upload_time:.1f} seconds")
+        
+        # Step 5: Store metadata
+        st.session_state.processing_status = "storing"
+        st.session_state.processing_start_time = time.time()
+        st.session_state.upload_progress = 80
+        
+        with progress_placeholder.container():
+            st.progress(0.8)
+            status_placeholder.info("💾 Storing video metadata in database...")
+        
+        # Store metadata (very fast operation)
+        storing_timeout = 30
+        
+        process_response = requests.post(
+            f"{api_base_url}/process-video/",
+            json={"filename": uploaded_file.name},
+            timeout=storing_timeout
+        )
+        
+        # Step 6: Complete
+        if process_response.status_code == 200:
+            result = process_response.json()
+            processing_time = time.time() - st.session_state.processing_start_time
+            
+            st.session_state.processing_status = "completed"
+            st.session_state.uploaded_video_id = result.get('video_id')
+            st.session_state.uploaded_video_name = uploaded_file.name
+            st.session_state.upload_progress = 100
+            
+            with progress_placeholder.container():
+                st.progress(1.0)
+                status_placeholder.success(f"✅ Video stored successfully! Total time: {upload_time + processing_time:.1f} seconds")
+            
+            st.info("🔍 **Note**: Video processing (keyframes, embeddings) will happen when you search - this makes uploads super fast!")
+            
+        else:
+            st.session_state.processing_status = "error"
+            st.session_state.error_message = f"Processing failed: {process_response.text}"
+            with progress_placeholder.container():
+                st.error(f"❌ Processing failed: {process_response.text}")
+        
+    except requests.exceptions.Timeout:
+        st.session_state.processing_status = "error"
+        st.session_state.error_message = "Upload/processing timed out. This can happen with very large files or slow connections. You can try again."
+        with progress_placeholder.container():
+            st.error("❌ Upload timed out. Try again with a smaller file.")
+            
+    except Exception as e:
+        st.session_state.processing_status = "error"
+        st.session_state.error_message = str(e)
+        with progress_placeholder.container():
+            st.error(f"❌ Error: {str(e)}")
+
 def main():
     """Main Streamlit application."""
     
@@ -97,6 +203,8 @@ def main():
         st.session_state.current_video_name = None
     if 'current_segment' not in st.session_state:
         st.session_state.current_segment = 0
+    if 'target_segment_time' not in st.session_state:
+        st.session_state.target_segment_time = None
     
     # Debug session state
     st.sidebar.write("Debug - Selected Video:", st.session_state.selected_video)
@@ -111,55 +219,151 @@ def main():
         help="Maximum number of results to return"
     )
     
-    # Main search interface
-    st.header("🔍 Search")
+    # Check for existing videos that are actually available in MinIO
+    try:
+        response = requests.get(f"{api_base_url}/check-minio-videos", timeout=5)
+        if response.status_code == 200:
+            minio_data = response.json()
+            # Only include videos that are available in MinIO
+            available_videos = [v for v in minio_data.get('videos', []) if v['status'] == 'available']
+            existing_videos = []
+            for v in available_videos:
+                # Convert to format expected by frontend
+                existing_videos.append({
+                    'id': v['id'],
+                    'filename': v['filename'],
+                    'duration_seconds': 0,  # Will be filled from database if needed
+                })
+            st.sidebar.write(f"Debug - Found {len(existing_videos)} available videos in MinIO")
+        else:
+            existing_videos = []
+    except:
+        existing_videos = []
     
-    col1, col2 = st.columns([3, 1])
+    # Show existing videos option
+    if existing_videos:
+        st.header("🎬 Available Videos")
+        st.info("Select a video that's already processed, or upload a new one below.")
+        
+        video_options = ["Upload new video..."] + [f"{v['filename']} ({v['duration_seconds']:.0f}s)" for v in existing_videos]
+        selected_option = st.selectbox("Choose a video:", video_options)
+        
+        if selected_option != "Upload new video...":
+            # User selected an existing video
+            selected_idx = video_options.index(selected_option) - 1
+            selected_video = existing_videos[selected_idx]
+            
+            st.session_state.processing_status = "completed"
+            st.session_state.uploaded_video_id = selected_video['id']
+            st.session_state.uploaded_video_name = selected_video['filename']
+            
+            st.success(f"✅ Selected: {selected_video['filename']} - Ready for search!")
     
-    with col1:
-        query = st.text_input(
-            "Enter your search query:",
-            placeholder="e.g., 'blue strip', 'red circle', 'bright colors'",
-            key="search_query"
+    # Video Upload Section (only show if no video selected)
+    if not (st.session_state.get('processing_status') == 'completed' and st.session_state.get('uploaded_video_id')):
+        st.header("📹 Upload New Video")
+        
+        # Add upload info
+        st.info("🚀 **Fast Upload Mode:**\n- No file size limits - upload any size video\n- Supported formats: MP4, AVI, MOV, MKV, WEBM\n- Upload stores video instantly - no heavy processing\n- Processing happens only when you search (on-demand)")
+        
+        uploaded_file = st.file_uploader(
+            "Choose a video file",
+            type=['mp4', 'avi', 'mov', 'mkv', 'webm'],
+            help="Upload a video file to search through"
         )
+        
+        if uploaded_file is not None:
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.video(uploaded_file)
+                
+            with col2:
+                file_size_mb = uploaded_file.size / (1024*1024)
+                st.write(f"**File:** {uploaded_file.name}")
+                st.write(f"**Size:** {file_size_mb:.1f} MB")
+                
+                # Show file info (no warnings)
+                if file_size_mb > 1000:  # 1GB+
+                    st.info(f"📹 Large video ({file_size_mb:.1f} MB) - Processing will take time")
+                elif file_size_mb > 100:
+                    st.info(f"📹 Medium video ({file_size_mb:.1f} MB)")
+                
+                # Estimate upload time (much faster now)
+                upload_time_est = max(1, int(file_size_mb / 100))  # Much faster: 100MB per minute
+                st.write(f"**Estimated upload time:** ~{upload_time_est} minute(s)")
+                st.write("**Heavy processing:** Only when you search! 🔍")
+                
+                if st.button("Upload Video", type="primary", use_container_width=True):
+                    upload_and_store_video(uploaded_file, api_base_url)
     
-    with col2:
-        search_button = st.button("🔍 Search", type="primary", use_container_width=True)
+    # Show processing status (simplified - detailed progress is handled in upload function)
+    if st.session_state.get('processing_status') == "error":
+        st.error(f"❌ Error: {st.session_state.get('error_message', 'Unknown error')}")
+        
+        # Add troubleshooting tips
+        st.info("💡 **Troubleshooting Tips:**\n"
+               "- Check your internet connection\n"
+               "- Make sure the video format is supported (MP4 works best)\n"
+               "- Try refreshing the page and uploading again")
     
-    # Perform search
-    if search_button and query:
-        with st.spinner("Searching..."):
-            try:
-                # Use query-based search endpoint
-                endpoint = f"{api_base_url}/search/on-demand"
-                
-                # Make API request
-                params = {"q": query, "top_k": top_k}
-                
-                response = requests.get(
-                    endpoint,
-                    params=params,
-                    timeout=60  # Longer timeout for query-based search
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    st.session_state.search_results = data
-                    st.session_state.current_query = query
-                    display_gallery(data, query, api_base_url)
-                else:
-                    st.error(f"Search failed: {response.status_code} - {response.text}")
+    # Initialize search variables
+    search_button = False
+    query = ""
+    
+    # Only show search if video is uploaded and processed
+    if st.session_state.get('processing_status') == 'completed' and st.session_state.get('uploaded_video_id'):
+        st.markdown("---")
+        
+        # Main search interface
+        st.header("🔍 Search Your Video")
+        st.info("💡 **First search may take 1-2 minutes** as we extract frames and generate embeddings on-demand. Subsequent searches will be faster!")
+        
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            query = st.text_input(
+                "Enter your search query:",
+                placeholder="e.g., 'blue strip', 'red circle', 'bright colors'",
+                key="search_query"
+            )
+        
+        with col2:
+            search_button = st.button("🔍 Search", type="primary", use_container_width=True)
+    
+        # Perform search (only if we have an uploaded video)
+        if search_button and query and st.session_state.get('uploaded_video_id'):
+            with st.spinner("Searching..."):
+                try:
+                    # Use query-based search endpoint with video_id filter
+                    endpoint = f"{api_base_url}/search/video/{st.session_state.uploaded_video_id}"
                     
-            except requests.exceptions.ConnectionError:
-                st.error("❌ Could not connect to API. Make sure the backend server is running.")
-            except requests.exceptions.Timeout:
-                st.error("❌ Search request timed out. Try a simpler query.")
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
+                    # Make API request
+                    params = {"q": query, "top_k": top_k}
+                    
+                    response = requests.get(
+                        endpoint,
+                        params=params,
+                        timeout=60  # Longer timeout for query-based search
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        st.session_state.search_results = data
+                        st.session_state.current_query = query
+                        st.success(f"✅ Search completed! Found results for '{query}'")
+                    else:
+                        st.error(f"Search failed: {response.status_code} - {response.text}")
+                        
+                except requests.exceptions.ConnectionError:
+                    st.error("❌ Could not connect to API. Make sure the backend server is running.")
+                except requests.exceptions.Timeout:
+                    st.error("❌ Search request timed out. Try a simpler query.")
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
     
-    # Display previous results if available
-    elif st.session_state.search_results:
-        st.info(f"Showing previous results for: '{st.session_state.current_query}'")
+    # Display results if available
+    if st.session_state.search_results:
         display_gallery(st.session_state.search_results, st.session_state.current_query, api_base_url)
     
     # Health check in sidebar
@@ -278,166 +482,143 @@ def display_video_player(video_id, api_base_url):
     
     video_name = video_results[0].get('video_filename', 'Unknown Video')
     st.subheader(f"📹 {video_name}")
-    st.markdown(f"**Query:** '{st.session_state.current_query}'")
+    current_query = st.session_state.get('current_query', 'Unknown Query')
+    st.markdown(f"**Query:** '{current_query}'")
     st.markdown(f"**Found {len(video_results)} relevant segments**")
     
-    # Video player section
-    st.subheader("🎥 Video Player")
-    
-    # Create video player with HTML and JavaScript for seeking
+    # Use the actual video from MinIO
     video_url = f"{api_base_url}/video/{video_id}/file"
     
     # Get current segment info for initial seek
-    if not video_results:
-        st.error("No video results found.")
-        return
-    
-    # Ensure current_segment is within bounds
     if st.session_state.current_segment >= len(video_results):
         st.session_state.current_segment = 0
     
     current_result = video_results[st.session_state.current_segment]
     initial_time = current_result.get('segment_start_seconds') or current_result.get('timestamp_seconds', 0)
     
+    # Use target time if available (from segment jump), otherwise use current segment time
+    target_time = st.session_state.target_segment_time if st.session_state.target_segment_time is not None else initial_time
+    
+    # Clean video player with auto-seek functionality
     video_html = f"""
-    <video id="videoPlayer" width="100%" height="400" controls>
-        <source src="{video_url}" type="video/mp4">
-        Your browser does not support the video tag.
-    </video>
+    <div style="text-align: center; margin-bottom: 15px;">
+        <video id="mainVideo" width="100%" height="400" controls preload="metadata">
+            <source src="{video_url}" type="video/mp4">
+            Your browser does not support the video tag.
+        </video>
+    </div>
+    
     <script>
-        // Auto-seek to current segment time when video loads
-        document.addEventListener('DOMContentLoaded', function() {{
-            const video = document.getElementById('videoPlayer');
-            video.addEventListener('loadedmetadata', function() {{
-                video.currentTime = {initial_time};
-            }});
+        const video = document.getElementById('mainVideo');
+        
+        // Auto-seek to target time when video is ready
+        function seekToTime(time) {{
+            console.log('Seeking to time:', time);
+            if (video.readyState >= 2) {{
+                video.currentTime = time;
+            }} else {{
+                video.addEventListener('loadedmetadata', function() {{
+                    video.currentTime = time;
+                }}, {{ once: true }});
+            }}
+        }}
+        
+        // Auto-seek when video is ready
+        video.addEventListener('loadedmetadata', function() {{
+            seekToTime({target_time});
+        }});
+        
+        // Handle video seeking completion
+        video.addEventListener('seeked', function() {{
+            console.log('Video seeked to:', video.currentTime);
+        }});
+        
+        // Handle video errors
+        video.addEventListener('error', function(e) {{
+            console.error('Video error:', e);
         }});
     </script>
     """
     
-    st.components.v1.html(video_html, height=450)
+    # Show current target time and segment info
+    current_result = video_results[st.session_state.current_segment]
+    current_start = current_result.get('segment_start_seconds') or current_result.get('timestamp_seconds', 0)
+    current_end = current_result.get('segment_end_seconds', current_start + 2.0)
     
-    # Segment navigation controls
-    st.subheader("🎮 Segment Navigation")
+    if st.session_state.target_segment_time is not None:
+        st.success(f"🎯 Jumping to: {st.session_state.target_segment_time:.1f}s")
+    else:
+        st.info(f"📍 Current Segment: {current_start:.1f}s - {current_end:.1f}s")
     
-    # Current segment tracking (already initialized in main())
-    pass
+    # Clear the target time after using it
+    if st.session_state.target_segment_time is not None:
+        st.session_state.target_segment_time = None
     
-    # Playback controls
-    col1, col2, col3, col4 = st.columns(4)
+    st.components.v1.html(video_html, height=500)
+    
+    # Simple segment navigation
+    st.markdown("---")
+    st.subheader("🎮 Navigation")
+    
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        if st.button("⏮️ Previous", use_container_width=True):
+        if st.button("⏮️ Previous"):
             if st.session_state.current_segment > 0:
                 st.session_state.current_segment -= 1
+                # Set target time for the new segment
+                new_result = video_results[st.session_state.current_segment]
+                new_time = new_result.get('segment_start_seconds') or new_result.get('timestamp_seconds', 0)
+                st.session_state.target_segment_time = new_time
                 st.rerun()
     
     with col2:
-        if st.button("▶️ Play Current", use_container_width=True):
-            # This will trigger a rerun and the video will auto-seek to current segment
-            st.rerun()
-    
-    with col3:
-        if st.button("⏭️ Next", use_container_width=True):
+        if st.button("⏭️ Next"):
             if st.session_state.current_segment < len(video_results) - 1:
                 st.session_state.current_segment += 1
+                # Set target time for the new segment
+                new_result = video_results[st.session_state.current_segment]
+                new_time = new_result.get('segment_start_seconds') or new_result.get('timestamp_seconds', 0)
+                st.session_state.target_segment_time = new_time
                 st.rerun()
     
-    with col4:
-        if st.button("🔄 Reset", use_container_width=True):
+    with col3:
+        if st.button("🔄 Reset"):
             st.session_state.current_segment = 0
+            # Set target time for first segment
+            first_result = video_results[0]
+            first_time = first_result.get('segment_start_seconds') or first_result.get('timestamp_seconds', 0)
+            st.session_state.target_segment_time = first_time
             st.rerun()
     
-    # Current segment info
-    if video_results:
-        current_result = video_results[st.session_state.current_segment]
-        start_time = current_result.get('segment_start_seconds') or current_result.get('timestamp_seconds', 0)
-        end_time = current_result.get('segment_end_seconds')
-        if end_time is None:
-            end_time = start_time + 2.0
-        
-        st.info(f"**Current Segment {st.session_state.current_segment + 1}:** {start_time:.1f}s - {end_time:.1f}s (Score: {current_result['score']:.3f})")
+    # Interactive segment list with jump buttons
+    st.markdown("---")
+    st.subheader("📋 Segments")
     
-    # Search result segments timeline
-    st.subheader("📊 Query-Specific Segments")
-    
-    # Create a more interactive segment display
-    for i, result in enumerate(video_results):
-        with st.container():
-            # Highlight current segment
-            if i == st.session_state.current_segment:
-                st.markdown("**🟢 CURRENT SEGMENT**")
-            
-            col1, col2, col3, col4 = st.columns([1, 2, 1, 1])
-            
-            with col1:
-                st.markdown(f"**Segment {i+1}**")
-                start_time = result.get('segment_start_seconds') or result.get('timestamp_seconds', 0)
-                end_time = result.get('segment_end_seconds')
-                
-                if end_time is None:
-                    end_time = start_time + 2.0
-                
-                start_minutes = int(start_time // 60)
-                start_seconds = int(start_time % 60)
-                end_minutes = int(end_time // 60)
-                end_seconds = int(end_time % 60)
-                
-                st.markdown(f"{start_minutes}:{start_seconds:02d} - {end_minutes}:{end_seconds:02d}")
-            
-            with col2:
-                # Progress bar for segment
-                duration = end_time - start_time
-                progress = duration / 10.0  # Assuming 10s video
-                st.progress(progress)
-                
-                # Show score and caption
-                st.markdown(f"**Score:** {result['score']:.3f}")
-                if result.get('caption'):
-                    st.markdown(f"**Caption:** {result['caption']}")
-            
-            with col3:
-                if st.button(f"▶️ Play", key=f"play_segment_{i}"):
-                    st.session_state.current_segment = i
-                    st.rerun()
-            
-            with col4:
-                if st.button(f"🎯 Jump", key=f"jump_segment_{i}"):
-                    st.session_state.current_segment = i
-                    st.rerun()
-        
-        st.markdown("---")
-    
-    # Timeline visualization
-    st.subheader("📈 Timeline Overview")
-    
-    # Create a simple timeline visualization
-    timeline_data = []
     for i, result in enumerate(video_results):
         start_time = result.get('segment_start_seconds') or result.get('timestamp_seconds', 0)
-        end_time = result.get('segment_end_seconds')
-        if end_time is None:
-            end_time = start_time + 2.0
+        end_time = result.get('segment_end_seconds', start_time + 2.0)
         
-        timeline_data.append({
-            "segment": i + 1,
-            "start": start_time,
-            "end": end_time,
-            "score": result['score']
-        })
-    
-    # Display timeline as a simple chart
-    if timeline_data:
-        st.write("**Segment Timeline:**")
-        for item in timeline_data:
+        # Create columns for segment info and jump button
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
             # Highlight current segment
-            if item['segment'] - 1 == st.session_state.current_segment:
-                st.write(f"🟢 **Segment {item['segment']}:** {item['start']:.1f}s - {item['end']:.1f}s (Score: {item['score']:.3f})")
+            if i == st.session_state.current_segment:
+                st.markdown(f"**🎯 Segment {i + 1}:** {start_time:.1f}s - {end_time:.1f}s")
             else:
-                st.write(f"Segment {item['segment']}: {item['start']:.1f}s - {item['end']:.1f}s (Score: {item['score']:.3f})")
+                st.markdown(f"Segment {i + 1}: {start_time:.1f}s - {end_time:.1f}s")
+        
+        with col2:
+            # Jump button for each segment
+            if st.button(f"🎯 Jump", key=f"jump_{i}"):
+                st.session_state.current_segment = i
+                # Store the target time for the video to seek to
+                st.session_state.target_segment_time = start_time
+                st.rerun()
     
     # Back button
-    if st.button("← Back to Gallery"):
+    if st.button("← Back to Search"):
         st.session_state.selected_video = None
         st.session_state.current_segment = 0
         st.rerun()

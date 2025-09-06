@@ -1,0 +1,9 @@
+[server]
+maxUploadSize = 99999
+maxMessageSize = 99999
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

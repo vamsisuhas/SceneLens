@@ -45,7 +45,7 @@ class OnDemandExtractor:
         self.bucket_name = "scenelens"
     
     def extract_query_specific_frames(self, query: str, video_filename: str, 
-                                    top_k: int = 10, frame_interval: float = 0.5) -> List[Dict]:
+                                    top_k: int = 10, frame_interval: float = 0.25) -> List[Dict]:
         """
         Extract frames from video that match the search query.
         
