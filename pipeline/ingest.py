@@ -14,6 +14,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.database import get_db_session, init_db
 from pipeline.models import Video
+from pipeline.keyframe import extract_keyframes
+from pipeline.captions import generate_captions_for_frames
+from pipeline.vision_embed import generate_embeddings_for_frames
+from minio import Minio
+import tempfile
+import uuid
 
 
 def get_video_info(video_path):
@@ -107,6 +113,82 @@ def ingest_video(video_path, output_dir="data/videos"):
         raise
     finally:
         db.close()
+
+
+class VideoIngestPipeline:
+    """Complete video processing pipeline."""
+    
+    def __init__(self):
+        self.minio_client = Minio(
+            "localhost:9000",
+            access_key="scenelens",
+            secret_key="scenelens_dev123",
+            secure=False
+        )
+        self.bucket_name = "scenelens"
+    
+    def process_video_from_minio(self, filename: str, minio_path: str) -> str:
+        """Process a video that's already uploaded to MinIO."""
+        print(f"Processing video from MinIO: {minio_path}")
+        
+        # Download video from MinIO to temp location
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_video:
+            try:
+                self.minio_client.fget_object(self.bucket_name, minio_path, temp_video.name)
+                video_path = temp_video.name
+            except Exception as e:
+                print(f"Failed to download video from MinIO: {e}")
+                return None
+        
+        try:
+            # Get video metadata
+            video_info = get_video_info(video_path)
+            print(f"Video info: {video_info}")
+            
+            # Store video in database
+            init_db()
+            db = get_db_session()
+            
+            try:
+                # Create video record
+                video = Video(
+                    filename=filename,
+                    title=Path(filename).stem.replace("_", " ").title(),
+                    **video_info
+                )
+                db.add(video)
+                db.commit()
+                video_id = video.id
+                print(f"Video record created with ID: {video_id}")
+                
+                # Extract keyframes
+                print("Extracting keyframes...")
+                keyframes_dir = f"data/frames/{Path(filename).stem}"
+                os.makedirs(keyframes_dir, exist_ok=True)
+                keyframes = extract_keyframes(video_path, keyframes_dir, interval_seconds=1.0)
+                
+                # Generate captions for keyframes
+                print("Generating captions...")
+                captions = generate_captions_for_frames(keyframes_dir)
+                
+                # Generate embeddings and store segments
+                print("Generating embeddings...")
+                generate_embeddings_for_frames(keyframes_dir)
+                
+                print(f"✅ Video processing completed for: {filename}")
+                return video_id
+                
+            except Exception as e:
+                db.rollback()
+                print(f"Database error during processing: {e}")
+                return None
+            finally:
+                db.close()
+                
+        finally:
+            # Clean up temp file
+            if os.path.exists(video_path):
+                os.remove(video_path)
 
 
 def main():

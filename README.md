@@ -2,20 +2,6 @@
 
 SceneLens is an intelligent video search system that uses CLIP and BLIP models to enable semantic search through video content using natural language queries.
 
-## 🚀 Demo Status
-
-**Current Demo State:**
-- Infrastructure: PostgreSQL + MinIO running
-- Backend API: Running on http://localhost:8000
-- Frontend UI: Running on http://localhost:8501
-- Sample Video: Processed with 5 keyframes
-- Search Index: FAISS with 5 vectors ready
-- Web Interface: Fully functional with image display
-
-**Quick Access:**
-- **Web UI**: [http://localhost:8501](http://localhost:8501)
-- **API Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
-
 ## Prerequisites & Installation
 
 ### System Dependencies
@@ -98,7 +84,6 @@ cd infra && docker-compose up -d && cd ..
 
 # 2. Create and process sample video
 mkdir -p data/videos data/frames artifacts faiss
-ffmpeg -f lavfi -i testsrc=duration=10:size=320x240:rate=1 -pix_fmt yuv420p data/videos/demo.mp4 -y
 python run_pipeline.py data/videos/demo.mp4
 
 # 3. Start backend API (choose one method)
@@ -110,12 +95,6 @@ streamlit run ui/app.py --server.port 8501 &
 
 # 5. Open browser and search
 open http://localhost:8501
-
-# ✅ Try these searches:
-# - "colorful circle"
-# - "black background"
-# - "geometric patterns"
-# - "bright colors"
 ```
 
 ## API Endpoints
@@ -156,13 +135,3 @@ SceneLens/
 │   └── docker-compose.yml # PostgreSQL + MinIO
 └── requirements.txt # Python dependencies
 ```
-
-## Features
-
-- 🎬 **Video Processing**: Automatic keyframe extraction and analysis
-- 🧠 **AI Models**: CLIP for vision, BLIP for captions
-- 🔍 **Semantic Search**: Natural language video search
-- 🖼️ **Visual Interface**: Clean Streamlit web UI
-- 🚀 **Fast API**: RESTful backend with FastAPI
-- 📊 **Vector Search**: FAISS-powered similarity search
-- 🗄️ **Data Storage**: PostgreSQL + MinIO object storage
