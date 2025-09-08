@@ -186,7 +186,7 @@ def main():
     """Main Streamlit application."""
     
     # Header
-    st.title("🎬 SceneLens - AI Video Search")
+    st.title("SceneLens - AI Video Search")
     st.markdown("""
     Search through video content using natural language queries. 
     Find specific moments, objects, or scenes in your videos.
@@ -242,7 +242,7 @@ def main():
     
     # Show existing videos option
     if existing_videos:
-        st.header("🎬 Available Videos")
+        st.header("Available Videos")
         st.info("Select a video that's already processed, or upload a new one below.")
         
         video_options = ["Upload new video..."] + [f"{v['filename']} ({v['duration_seconds']:.0f}s)" for v in existing_videos]
@@ -261,10 +261,10 @@ def main():
     
     # Video Upload Section (only show if no video selected)
     if not (st.session_state.get('processing_status') == 'completed' and st.session_state.get('uploaded_video_id')):
-        st.header("📹 Upload New Video")
+        st.header("Upload New Video")
         
         # Add upload info
-        st.info("🚀 **Fast Upload Mode:**\n- No file size limits - upload any size video\n- Supported formats: MP4, AVI, MOV, MKV, WEBM\n- Upload stores video instantly - no heavy processing\n- Processing happens only when you search (on-demand)")
+        st.info("\n- No file size limits - upload any size video\n- Supported formats: MP4, AVI, MOV, MKV, WEBM")
         
         uploaded_file = st.file_uploader(
             "Choose a video file",
