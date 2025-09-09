@@ -1,6 +1,6 @@
 # SceneLens - AI Video Search System
 
-SceneLens is an intelligent video search system that uses CLIP and BLIP models to enable semantic search through video content using natural language queries.
+SceneLens is an intelligent video search system that uses on-demand CLIP-based frame extraction to enable semantic search through video content using natural language queries. No pre-processing required!
 
 ## Prerequisites & Installation
 
@@ -70,10 +70,10 @@ streamlit run ui/app.py --server.port 8501 &
 # ✅ Open in browser: open http://localhost:8501
 ```
 
-### 4. Process Video
+### 4. Upload Video (On-Demand Processing)
 ```bash
-# Run complete pipeline to process a video
-python run_pipeline.py <video_name>
+# Upload video for on-demand search (no heavy pre-processing!)
+python run_pipeline.py <video_file_path>
 ```
 
 ## Complete Demo (Recommended)
@@ -82,26 +82,26 @@ python run_pipeline.py <video_name>
 # 1. Start infrastructure services
 cd infra && docker-compose up -d && cd ..
 
-# 2. Create and process sample video
-mkdir -p data/videos data/frames artifacts faiss
-python run_pipeline.py data/videos/demo.mp4
+# 2. Upload video (instant setup - no heavy processing!)
+python run_pipeline.py /path/to/your/video.mp4
 
-# 3. Start backend API (choose one method)
+# 3. Start backend API
 uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload &
-# OR: python backend/app.py &
 
 # 4. Start frontend UI  
 streamlit run ui/app.py --server.port 8501 &
 
 # 5. Open browser and search
 open http://localhost:8501
+# First search takes 1-2 minutes (extracting relevant frames)
+# Subsequent searches are much faster!
 ```
 
 ## API Endpoints
 
 - **Health Check**: `GET http://localhost:8000/health`
-- **Semantic Search**: `GET http://localhost:8000/search?q=query&top_k=10`
-- **Caption Search**: `GET http://localhost:8000/search/caption?q=query&top_k=10`
+- **On-Demand Search**: `GET http://localhost:8000/search/on-demand?q=query&top_k=10`
+- **Video-Specific Search**: `GET http://localhost:8000/search/video/{video_id}?q=query&top_k=10`
 
 ### Example API Usage
 
@@ -109,11 +109,11 @@ open http://localhost:8501
 # Health check
 curl http://localhost:8000/health
 
-# Semantic search
-curl "http://localhost:8000/search?q=colorful+circle&top_k=5"
+# On-demand search (extracts relevant frames in real-time)
+curl "http://localhost:8000/search/on-demand?q=blue+circle&top_k=5"
 
-# Caption search  
-curl "http://localhost:8000/search/caption?q=circle&top_k=3"
+# Video-specific search
+curl "http://localhost:8000/search/video/VIDEO_ID?q=red+strip&top_k=3"
 ```
 
 ## Architecture
@@ -122,16 +122,16 @@ curl "http://localhost:8000/search/caption?q=circle&top_k=3"
 SceneLens/
 ├── backend/          # FastAPI backend server
 │   ├── app.py       # Main API application
-│   └── search.py    # Search engine logic
+│   └── search.py    # On-demand search engine
 ├── ui/              # Streamlit frontend
 │   └── app.py       # Web interface
-├── pipeline/        # Video processing pipeline
-│   ├── ingest.py    # Video ingestion
-│   ├── keyframe.py  # Frame extraction
-│   ├── captions.py  # AI caption generation
-│   ├── vision_embed.py # CLIP embeddings
-│   └── fuse_index.py   # Search index creation
+├── pipeline/        # Video processing
+│   ├── ingest.py    # Lightweight video metadata storage
+│   ├── on_demand_extract.py # Intelligent frame extraction
+│   ├── models.py    # Database models
+│   └── database.py  # Database connection
 ├── infra/           # Infrastructure
 │   └── docker-compose.yml # PostgreSQL + MinIO
+├── run_pipeline.py  # Video upload and setup
 └── requirements.txt # Python dependencies
 ```

@@ -2,7 +2,6 @@ torch>=2.0.0
 transformers>=4.25.0
 sentence-transformers>=2.2.0
 opencv-python>=4.8.0
-faiss-cpu>=1.7.4
 fastapi>=0.95.0
 uvicorn>=0.20.0
 sqlalchemy>=2.0.0
