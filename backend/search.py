@@ -238,30 +238,8 @@ class SearchEngine:
         logger.info(f"Found {len(relevant_frames)} frames above threshold {similarity_threshold} out of {len(sorted_frames)} total frames")
         
         if not relevant_frames:
-            # If no relevant frames, create segments from top frames anyway
-            logger.info(f"No frames above threshold, using top frames")
-            if sorted_frames:
-                # Take the top 3 frames and create basic segments
-                top_frames = sorted(sorted_frames, key=lambda f: f['similarity_score'], reverse=True)[:3]
-                segments = []
-                for frame in top_frames:
-                    segment = {
-                        'start_time': frame['timestamp_seconds'],
-                        'end_time': frame['timestamp_seconds'] + 1.0,
-                        'start_frame': frame['frame_number'],
-                        'best_score': frame['similarity_score'],
-                        'best_image': frame['pil_image'],
-                        'keyframe_path': frame.get('keyframe_path'),
-                        'caption': self._generate_segment_caption(
-                            frame['timestamp_seconds'], 
-                            frame['timestamp_seconds'] + 1.0, 
-                            query, 
-                            frame.get('caption')
-                        )
-                    }
-                    segments.append(segment)
-                logger.info(f"Created {len(segments)} basic segments from top frames")
-                return segments
+            # No frames meet the relevance threshold - return no results
+            logger.info(f"No frames above threshold {similarity_threshold} - returning no results for query: '{query}'")
             return []
         
         # Find continuous content regions by analyzing temporal gaps

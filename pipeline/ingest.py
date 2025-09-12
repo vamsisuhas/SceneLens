@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Video ingestion script for SceneLens."""
+"""Video ingestion script for SceneLens - On-demand approach."""
 
 import os
 import sys
 import argparse
 import cv2
 from pathlib import Path
-from tqdm import tqdm
 
 import sys
 import os
@@ -14,12 +13,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline.database import get_db_session, init_db
 from pipeline.models import Video
-from pipeline.keyframe import extract_keyframes
-from pipeline.captions import generate_captions_for_frames
-from pipeline.vision_embed import generate_embeddings_for_frames
 from minio import Minio
 import tempfile
-import uuid
 
 
 def get_video_info(video_path):
@@ -115,85 +110,48 @@ def ingest_video(video_path, output_dir="data/videos"):
         db.close()
 
 
-class VideoIngestPipeline:
-    """Complete video processing pipeline."""
+def store_video_metadata(filename: str, video_path: str) -> str:
+    """Store video metadata in database - lightweight approach for on-demand processing."""
+    print(f"Storing metadata for video: {filename}")
     
-    def __init__(self):
-        self.minio_client = Minio(
-            "localhost:9000",
-            access_key="scenelens",
-            secret_key="scenelens_dev123",
-            secure=False
-        )
-        self.bucket_name = "scenelens"
-    
-    def process_video_from_minio(self, filename: str, minio_path: str) -> str:
-        """Process a video that's already uploaded to MinIO."""
-        print(f"Processing video from MinIO: {minio_path}")
+    try:
+        # Get video metadata
+        video_info = get_video_info(video_path)
+        print(f"Video info: {video_info}")
         
-        # Download video from MinIO to temp location
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_video:
-            try:
-                self.minio_client.fget_object(self.bucket_name, minio_path, temp_video.name)
-                video_path = temp_video.name
-            except Exception as e:
-                print(f"Failed to download video from MinIO: {e}")
-                return None
+        # Store video in database
+        init_db()
+        db = get_db_session()
         
         try:
-            # Get video metadata
-            video_info = get_video_info(video_path)
-            print(f"Video info: {video_info}")
+            # Create video record
+            video = Video(
+                filename=filename,
+                title=Path(filename).stem.replace("_", " ").title(),
+                **video_info
+            )
+            db.add(video)
+            db.commit()
+            video_id = video.id
+            print(f"✅ Video metadata stored with ID: {video_id}")
+            print("🔍 Video is ready for on-demand search - no pre-processing needed!")
+            return video_id
             
-            # Store video in database
-            init_db()
-            db = get_db_session()
-            
-            try:
-                # Create video record
-                video = Video(
-                    filename=filename,
-                    title=Path(filename).stem.replace("_", " ").title(),
-                    **video_info
-                )
-                db.add(video)
-                db.commit()
-                video_id = video.id
-                print(f"Video record created with ID: {video_id}")
-                
-                # Extract keyframes
-                print("Extracting keyframes...")
-                keyframes_dir = f"data/frames/{Path(filename).stem}"
-                os.makedirs(keyframes_dir, exist_ok=True)
-                keyframes = extract_keyframes(video_path, keyframes_dir, interval_seconds=1.0)
-                
-                # Generate captions for keyframes
-                print("Generating captions...")
-                captions = generate_captions_for_frames(keyframes_dir)
-                
-                # Generate embeddings and store segments
-                print("Generating embeddings...")
-                generate_embeddings_for_frames(keyframes_dir)
-                
-                print(f"✅ Video processing completed for: {filename}")
-                return video_id
-                
-            except Exception as e:
-                db.rollback()
-                print(f"Database error during processing: {e}")
-                return None
-            finally:
-                db.close()
-                
+        except Exception as e:
+            db.rollback()
+            print(f"Database error during metadata storage: {e}")
+            return None
         finally:
-            # Clean up temp file
-            if os.path.exists(video_path):
-                os.remove(video_path)
+            db.close()
+            
+    except Exception as e:
+        print(f"Error processing video metadata: {e}")
+        return None
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(description="Ingest video files into SceneLens")
+    """Main entry point - lightweight video metadata storage."""
+    parser = argparse.ArgumentParser(description="Store video metadata for SceneLens on-demand search")
     parser.add_argument("video_path", help="Path to input video file")
     parser.add_argument("--output-dir", default="data/videos", 
                        help="Output directory for processed videos")
@@ -201,10 +159,12 @@ def main():
     args = parser.parse_args()
     
     try:
+        # Use the legacy ingest_video function for backward compatibility
         video_id = ingest_video(args.video_path, args.output_dir)
-        print(f"Video ingestion complete! Video ID: {video_id}")
+        print(f"✅ Video metadata storage complete! Video ID: {video_id}")
+        print("🔍 Video is now ready for on-demand search!")
     except Exception as e:
-        print(f"Ingestion failed: {e}")
+        print(f"❌ Metadata storage failed: {e}")
         sys.exit(1)
 
 
