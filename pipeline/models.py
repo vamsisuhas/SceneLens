@@ -38,6 +38,7 @@ class Segment(Base):
     keyframe_path = Column(String(500))
     caption = Column(Text)
     caption_confidence = Column(Float)
+    embedding_index = Column(Integer)  # Index in FAISS
     created_at = Column(DateTime, default=func.now())
     
     # Relationship

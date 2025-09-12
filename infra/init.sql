@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS segments (
     keyframe_path VARCHAR(500),
     caption TEXT,
     caption_confidence FLOAT,
+    embedding_index INTEGER, -- Index in FAISS
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

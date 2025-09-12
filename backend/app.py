@@ -80,20 +80,38 @@ app.add_middleware(
 async def root():
     """Root endpoint with API information."""
     return {
-        "message": "SceneLens On-Demand Video Search API",
+        "message": "SceneLens Query-Based Search API",
         "version": "1.0.0",
         "endpoints": {
+            "search": "/search?q=<query>&top_k=<number>",
             "search_on_demand": "/search/on-demand?q=<query>&top_k=<number>&frame_interval=<seconds>",
-            "search_specific_video": "/search/video/{video_id}?q=<query>&top_k=<number>",
-            "get_video_file": "/video/{video_id}/file",
-            "upload_video": "/upload-video/",
-            "process_video": "/process-video/",
-            "check_minio_videos": "/check-minio-videos",
             "database_info": "/database",
+            "upload_video": "/upload-video/",
             "health": "/health",
             "docs": "/docs",
         }
     }
+
+
+@app.get("/search", response_model=SearchResponse)
+async def search(
+    q: str = Query(..., description="Search query text"),
+    top_k: int = Query(10, description="Number of results to return", ge=1, le=100)
+):
+    """Query-based search endpoint using prompt-driven frame extraction."""
+    try:
+        search_engine = get_search_engine()
+        results = search_engine.search_on_demand(q, top_k)
+        
+        return SearchResponse(
+            query=q,
+            results=[SearchResult(**result) for result in results],
+            total_results=len(results),
+            search_type="query_based"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
 
 @app.get("/search/on-demand", response_model=SearchResponse)
 async def search_on_demand(
@@ -147,6 +165,72 @@ async def search_specific_video(
     except Exception as e:
         logger.error(f"Video-specific search failed: {e}")
         raise HTTPException(status_code=500, detail=f"Video search failed: {str(e)}")
+
+
+@app.get("/video/{video_id}/segments")
+async def get_video_segments(video_id: str):
+    """Get all segments for a video with timeline data."""
+    try:
+        from pipeline.database import get_db_session
+        from pipeline.models import Video, Segment
+        
+        db = get_db_session()
+        video = db.query(Video).filter(Video.id == video_id).first()
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get all segments and deduplicate by timestamp
+        all_segments = db.query(Segment).filter(
+            Segment.video_id == video_id
+        ).order_by(Segment.timestamp_seconds).all()
+        
+        # Deduplicate segments by timestamp (keep the first one at each timestamp)
+        unique_segments = []
+        seen_timestamps = set()
+        
+        for segment in all_segments:
+            if segment.timestamp_seconds not in seen_timestamps:
+                unique_segments.append(segment)
+                seen_timestamps.add(segment.timestamp_seconds)
+        
+        logger.info(f"Found {len(all_segments)} total segments, deduplicated to {len(unique_segments)} unique segments")
+        
+        # Calculate segment boundaries
+        video_segments = []
+        for i, segment in enumerate(unique_segments):
+            # Calculate end time (next segment start or video end)
+            if i < len(unique_segments) - 1:
+                segment_end = unique_segments[i + 1].timestamp_seconds
+            else:
+                segment_end = segment.timestamp_seconds + 2.0  # Default duration
+            
+            video_segments.append({
+                "segment_id": str(segment.id),
+                "timestamp_seconds": segment.timestamp_seconds,
+                "start_seconds": segment.timestamp_seconds,
+                "end_seconds": segment_end,
+                "duration_seconds": segment_end - segment.timestamp_seconds,
+                "keyframe_path": segment.keyframe_path,
+                "caption": segment.caption,
+                "frame_number": segment.frame_number
+            })
+        
+        return {
+            "video_id": video_id,
+            "video_filename": video.filename,
+            "video_title": video.title,
+            "duration_seconds": video.duration_seconds,
+            "segments": video_segments,
+            "total_segments": len(video_segments),
+            "original_segments": len(all_segments)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting video segments: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get video segments: {str(e)}")
+    finally:
+        db.close()
+
 
 @app.get("/video/{video_id}/file")
 async def get_video_file(video_id: str):
@@ -308,7 +392,8 @@ async def process_video(request: dict):
                     width=0,  # Will be determined during search
                     height=0,  # Will be determined during search
                     file_size_bytes=file_size,
-                    created_at=datetime.utcnow()
+                    created_at=datetime.utcnow(),
+                    minio_path=video_path
                 )
                 
                 db.add(video)
@@ -346,61 +431,6 @@ async def health_check():
         "on_demand_extractor_loaded": search_engine.on_demand_extractor is not None,
         "search_type": "prompt_driven"
     }
-
-@app.get("/database")
-async def get_database_info():
-    """Get PostgreSQL database information and statistics."""
-    try:
-        from pipeline.database import get_db_session
-        from pipeline.models import Video, SearchLog
-        
-        db = get_db_session()
-        
-        # Get counts
-        video_count = db.query(Video).count()
-        log_count = db.query(SearchLog).count()
-        
-        # Get recent videos
-        recent_videos = db.query(Video).order_by(Video.created_at.desc()).limit(5).all()
-        videos_data = []
-        for video in recent_videos:
-            videos_data.append({
-                "id": str(video.id),
-                "filename": video.filename,
-                "title": video.title,
-                "duration_seconds": video.duration_seconds,
-                "fps": video.fps,
-                "resolution": f"{video.width}x{video.height}",
-                "file_size_bytes": video.file_size_bytes,
-                "created_at": video.created_at.isoformat()
-            })
-        
-        # Get recent search logs
-        recent_logs = db.query(SearchLog).order_by(SearchLog.created_at.desc()).limit(5).all()
-        logs_data = []
-        for log in recent_logs:
-            logs_data.append({
-                "id": str(log.id),
-                "query": log.query,
-                "results_count": log.results_count,
-                "response_time_ms": log.response_time_ms,
-                "created_at": log.created_at.isoformat()
-            })
-        
-        db.close()
-        
-        return {
-            "database": "PostgreSQL",
-            "statistics": {
-                "total_videos": video_count,
-                "total_search_logs": log_count
-            },
-            "recent_videos": videos_data,
-            "recent_search_logs": logs_data
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
 
 
 @app.get("/check-minio-videos")
@@ -442,6 +472,99 @@ async def check_minio_videos():
         raise HTTPException(status_code=500, detail=f"Failed to check videos: {str(e)}")
 
 
+@app.get("/database")
+async def get_database_info():
+    """Get PostgreSQL database information and statistics."""
+    try:
+        from pipeline.database import get_db_session
+        from pipeline.models import Video, Segment, SearchLog
+        
+        db = get_db_session()
+        
+        # Get counts
+        video_count = db.query(Video).count()
+        segment_count = db.query(Segment).count()
+        log_count = db.query(SearchLog).count()
+        
+        # Get recent videos
+        recent_videos = db.query(Video).order_by(Video.created_at.desc()).limit(5).all()
+        videos_data = []
+        for video in recent_videos:
+            videos_data.append({
+                "id": str(video.id),
+                "filename": video.filename,
+                "title": video.title,
+                "duration_seconds": video.duration_seconds,
+                "fps": video.fps,
+                "resolution": f"{video.width}x{video.height}",
+                "file_size_bytes": video.file_size_bytes,
+                "created_at": video.created_at.isoformat()
+            })
+        
+        # Get recent segments
+        recent_segments = db.query(Segment).order_by(Segment.created_at.desc()).limit(5).all()
+        segments_data = []
+        for segment in recent_segments:
+            segments_data.append({
+                "id": str(segment.id),
+                "video_id": str(segment.video_id),
+                "frame_number": segment.frame_number,
+                "timestamp_seconds": segment.timestamp_seconds,
+                "keyframe_path": segment.keyframe_path,
+                "caption": segment.caption,
+                "created_at": segment.created_at.isoformat()
+            })
+        
+        # Get recent search logs
+        recent_logs = db.query(SearchLog).order_by(SearchLog.created_at.desc()).limit(5).all()
+        logs_data = []
+        for log in recent_logs:
+            logs_data.append({
+                "id": str(log.id),
+                "query": log.query,
+                "results_count": log.results_count,
+                "response_time_ms": log.response_time_ms,
+                "created_at": log.created_at.isoformat()
+            })
+        
+        db.close()
+        
+        return {
+            "database": "PostgreSQL",
+            "statistics": {
+                "total_videos": video_count,
+                "total_segments": segment_count,
+                "total_search_logs": log_count
+            },
+            "recent_videos": videos_data,
+            "recent_segments": segments_data,
+            "recent_search_logs": logs_data
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
+
+def upload_image_to_minio(file_path, object_name):
+    """Uploads an image to MinIO."""
+    try:
+        minio_client.fput_object(
+            bucket_name, object_name, file_path
+        )
+        logger.info(f"Image {object_name} uploaded successfully.")
+    except Exception as e:
+        logger.error(f"Error uploading image: {e}")
+
+
+def get_image_from_minio(object_name, download_path):
+    """Retrieves an image from MinIO and saves it to the specified path."""
+    try:
+        minio_client.fget_object(
+            bucket_name, object_name, download_path
+        )
+        logger.info(f"Image {object_name} downloaded successfully to {download_path}.")
+    except Exception as e:
+        logger.error(f"Error downloading image: {e}")
+
 def main():
     """Main entry point for running the server."""
     uvicorn.run(
@@ -451,6 +574,7 @@ def main():
         reload=True,
         log_level="info"
     )
+
 
 if __name__ == "__main__":
     main()
