@@ -15,7 +15,8 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.search import get_search_engine
+from backend.blip2_search import get_blip2_search_engine
+from pipeline.minio_storage import MinIOStorage
 from minio import Minio
 
 # Configure logging
@@ -30,10 +31,9 @@ minio_client = Minio(
     secure=False
 )
 
-# Ensure bucket exists
+# Initialize MinIO storage
 bucket_name = "scenelens"
-if not minio_client.bucket_exists(bucket_name):
-    minio_client.make_bucket(bucket_name)
+minio_storage = MinIOStorage(minio_client, bucket_name)
 
 
 # Pydantic models
@@ -80,11 +80,13 @@ app.add_middleware(
 async def root():
     """Root endpoint with API information."""
     return {
-        "message": "SceneLens On-Demand Video Search API",
-        "version": "1.0.0",
+        "message": "SceneLens BLIP-2 Video Search API - Enhanced Accuracy",
+        "version": "2.0.0",
+        "search_engine": "BLIP-2 (Vision-Language Model)",
         "endpoints": {
-            "search_on_demand": "/search/on-demand?q=<query>&top_k=<number>&frame_interval=<seconds>",
-            "search_specific_video": "/search/video/{video_id}?q=<query>&top_k=<number>",
+            "search_on_demand": "/search/on-demand?q=<query>&top_k=<number>&frame_interval=<seconds> (BLIP-2)",
+            "search_specific_video": "/search/video/{video_id}?q=<query>&top_k=<number> (BLIP-2)",
+            "legacy_blip2_search": "/search/blip2/{video_id}?q=<query>&top_k=<number>&frame_interval=<seconds>",
             "get_video_file": "/video/{video_id}/file",
             "upload_video": "/upload-video/",
             "process_video": "/process-video/",
@@ -102,21 +104,40 @@ async def search_on_demand(
     frame_interval: float = Query(1.0, description="Frame extraction interval in seconds", ge=0.1, le=2.0),
     use_existing_first: bool = Query(True, description="Search existing keyframes first")
 ):
-    """On-demand search endpoint using dynamic frame extraction."""
+    """On-demand search endpoint using BLIP-2 for better accuracy."""
     try:
-        search_engine = get_search_engine()
-        results = search_engine.search_on_demand(
-            q, top_k, frame_interval, use_existing_first
-        )
+        # Use BLIP-2 search for better accuracy
+        from backend.blip2_search import get_blip2_search_engine
+        blip2_engine = get_blip2_search_engine()
+        
+        # Get all videos and search across them
+        all_videos = blip2_engine.minio_storage.list_videos()
+        all_results = []
+        
+        for video in all_videos:
+            if len(all_results) >= top_k:
+                break
+                
+            video_results = blip2_engine.search_video_with_blip2(
+                video_id=video['id'],
+                query=q,
+                top_k=max((top_k - len(all_results)) * 2, 10),
+                frame_interval=frame_interval
+            )
+            all_results.extend(video_results)
+        
+        # Sort by score and limit to top_k
+        all_results.sort(key=lambda x: x.get('score', 0), reverse=True)
+        all_results = all_results[:top_k]
         
         return SearchResponse(
             query=q,
-            results=[SearchResult(**result) for result in results],
-            total_results=len(results),
-            search_type="on_demand"
+            results=[SearchResult(**result) for result in all_results],
+            total_results=len(all_results),
+            search_type="blip2_on_demand"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"On-demand search failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"BLIP-2 search failed: {str(e)}")
 
 
 @app.get("/search/video/{video_id}", response_model=SearchResponse)
@@ -126,12 +147,43 @@ async def search_specific_video(
     top_k: int = Query(10, description="Number of results to return", ge=1, le=50),
     frame_interval: float = Query(0.1, description="Frame extraction interval in seconds", ge=0.1, le=2.0)
 ):
-    """Search within a specific video only."""
+    """Search within a specific video using BLIP-2 for better accuracy."""
     try:
-        search_engine = get_search_engine()
+        # Use BLIP-2 search for better accuracy
+        from backend.blip2_search import get_blip2_search_engine
+        blip2_engine = get_blip2_search_engine()
         
-        # Perform search with video_id filter
-        results = search_engine.search_specific_video(
+        results = blip2_engine.search_video_with_blip2(
+            video_id=video_id,
+            query=q,
+            top_k=top_k,
+            frame_interval=frame_interval
+        )
+        
+        return SearchResponse(
+            query=q,
+            results=results,
+            total_results=len(results),
+            search_type="blip2_video_specific"
+        )
+    except Exception as e:
+        logger.error(f"BLIP-2 video search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"BLIP-2 video search failed: {str(e)}")
+
+
+@app.get("/search/blip2/{video_id}", response_model=SearchResponse)
+async def search_video_with_blip2(
+    video_id: str,
+    q: str = Query(..., description="Search query text"),
+    top_k: int = Query(10, description="Number of results to return", ge=1, le=50),
+    frame_interval: float = Query(0.5, description="Frame extraction interval in seconds", ge=0.1, le=2.0)
+):
+    """Search within a specific video using BLIP-2 for intelligent analysis."""
+    try:
+        blip2_search_engine = get_blip2_search_engine()
+        
+        # Perform BLIP-2 based search
+        results = blip2_search_engine.search_video_with_blip2(
             query=q,
             video_id=video_id,
             top_k=top_k,
@@ -142,29 +194,28 @@ async def search_specific_video(
             query=q,
             results=results,
             total_results=len(results),
-            search_type="video_specific"
+            search_type="blip2_based"
         )
     except Exception as e:
-        logger.error(f"Video-specific search failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Video search failed: {str(e)}")
+        logger.error(f"BLIP-2 search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"BLIP-2 search failed: {str(e)}")
+
 
 @app.get("/video/{video_id}/file")
 async def get_video_file(video_id: str):
     """Get video file for playback."""
     try:
-        from pipeline.database import get_db_session
-        from pipeline.models import Video
         from fastapi.responses import StreamingResponse
         import io
         
-        db = get_db_session()
-        video = db.query(Video).filter(Video.id == video_id).first()
+        # Get video metadata from MinIO storage
+        video = minio_storage.get_video_metadata(video_id)
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
         
         try:
             # Get video data from MinIO
-            video_data = minio_client.get_object(bucket_name, f"videos/{video.filename}")
+            video_data = minio_client.get_object(bucket_name, f"videos/{video['filename']}")
             video_bytes = video_data.read()
             
             # Return video as streaming response
@@ -172,7 +223,7 @@ async def get_video_file(video_id: str):
                 io.BytesIO(video_bytes),
                 media_type="video/mp4",
                 headers={
-                    "Content-Disposition": f"inline; filename={video.filename}",
+                    "Content-Disposition": f"inline; filename={video['filename']}",
                     "Accept-Ranges": "bytes"
                 }
             )
@@ -184,8 +235,6 @@ async def get_video_file(video_id: str):
     except Exception as e:
         logger.error(f"Error getting video file: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get video file: {str(e)}")
-    finally:
-        db.close()
 
 
 @app.get("/image/{path:path}")
@@ -265,20 +314,11 @@ async def upload_video(file: UploadFile = File(...)):
 
 @app.post("/process-video/")
 async def process_video(request: dict):
-    """Ultra-lightweight video processing - just store basic metadata."""
+    """Process video and store complete metadata."""
     try:
         filename = request.get("filename")
         if not filename:
             raise HTTPException(status_code=400, detail="Filename is required")
-        
-        # Import database functions
-        import sys
-        import os
-        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        
-        from pipeline.database import get_db_session
-        from pipeline.models import Video
-        from datetime import datetime
         
         logger.info(f"Storing video metadata: {filename}")
         
@@ -290,33 +330,52 @@ async def process_video(request: dict):
             obj_stat = minio_client.stat_object(bucket_name, video_path)
             file_size = obj_stat.size
             
-            # Store in database with minimal metadata
-            db = get_db_session()
-            
             # Check if video already exists
-            existing_video = db.query(Video).filter(Video.filename == filename).first()
+            existing_videos = minio_storage.list_videos()
+            existing_video = next((v for v in existing_videos if v.get('filename') == filename), None)
+            
             if existing_video:
-                video_id = existing_video.id
+                video_id = existing_video['id']
                 logger.info(f"Video already exists with ID: {video_id}")
             else:
-                # Create new video record with basic info
-                video = Video(
-                    filename=filename,
-                    title=filename.split('.')[0],  # Use filename without extension as title
-                    duration_seconds=0,  # Will be determined during search
-                    fps=0,  # Will be determined during search
-                    width=0,  # Will be determined during search
-                    height=0,  # Will be determined during search
-                    file_size_bytes=file_size,
-                    created_at=datetime.utcnow()
-                )
+                # Download video temporarily to extract complete metadata
+                import tempfile
+                import cv2
+                from pathlib import Path
                 
-                db.add(video)
-                db.commit()
-                video_id = video.id
-                logger.info(f"Created new video record with ID: {video_id}")
-            
-            db.close()
+                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
+                    minio_client.fget_object(bucket_name, video_path, temp_file.name)
+                    temp_video_path = temp_file.name
+                
+                try:
+                    # Extract complete video metadata
+                    cap = cv2.VideoCapture(temp_video_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    duration = frame_count / fps if fps > 0 else 0
+                    cap.release()
+                    
+                    # Create video record with complete metadata
+                    video_data = {
+                        "filename": filename,
+                        "title": Path(filename).stem.replace("_", " ").title(),
+                        "duration_seconds": duration,
+                        "fps": fps,
+                        "width": width,
+                        "height": height,
+                        "file_size_bytes": file_size
+                    }
+                    
+                    video_id = minio_storage.store_video_metadata(video_data)
+                    logger.info(f"Created new video record with ID: {video_id}")
+                    
+                finally:
+                    # Clean up temp file
+                    import os
+                    if os.path.exists(temp_video_path):
+                        os.unlink(temp_video_path)
             
             return {
                 "message": f"Video {filename} uploaded successfully!",
@@ -324,7 +383,7 @@ async def process_video(request: dict):
                 "filename": filename,
                 "file_size": file_size,
                 "status": "ready_for_search",
-                "note": "Video stored - processing will happen on first search"
+                "note": "Video stored with complete metadata - ready for search"
             }
             
         except Exception as e:
@@ -339,85 +398,83 @@ async def process_video(request: dict):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    search_engine = get_search_engine()
-    return {
-        "status": "healthy",
-        "text_encoder_loaded": search_engine.text_encoder is not None,
-        "on_demand_extractor_loaded": search_engine.on_demand_extractor is not None,
-        "search_type": "prompt_driven"
-    }
+    try:
+        blip2_engine = get_blip2_search_engine()
+        return {
+            "status": "healthy",
+            "blip2_model_loaded": blip2_engine.model is not None,
+            "minio_storage_connected": blip2_engine.minio_storage is not None,
+            "search_type": "blip2_vlm"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "search_type": "blip2_vlm"
+        }
 
 @app.get("/database")
 async def get_database_info():
-    """Get PostgreSQL database information and statistics."""
+    """Get MinIO storage information and statistics."""
     try:
-        from pipeline.database import get_db_session
-        from pipeline.models import Video, SearchLog
-        
-        db = get_db_session()
-        
-        # Get counts
-        video_count = db.query(Video).count()
-        log_count = db.query(SearchLog).count()
+        # Get statistics from MinIO storage
+        stats = minio_storage.get_database_stats()
         
         # Get recent videos
-        recent_videos = db.query(Video).order_by(Video.created_at.desc()).limit(5).all()
+        all_videos = minio_storage.list_videos()
+        recent_videos = all_videos[:5]  # Get first 5 (already sorted by date)
         videos_data = []
         for video in recent_videos:
             videos_data.append({
-                "id": str(video.id),
-                "filename": video.filename,
-                "title": video.title,
-                "duration_seconds": video.duration_seconds,
-                "fps": video.fps,
-                "resolution": f"{video.width}x{video.height}",
-                "file_size_bytes": video.file_size_bytes,
-                "created_at": video.created_at.isoformat()
+                "id": video['id'],
+                "filename": video['filename'],
+                "title": video.get('title', ''),
+                "duration_seconds": video.get('duration_seconds', 0),
+                "fps": video.get('fps', 0),
+                "resolution": f"{video.get('width', 0)}x{video.get('height', 0)}",
+                "file_size_bytes": video.get('file_size_bytes', 0),
+                "created_at": video.get('created_at', '')
             })
         
         # Get recent search logs
-        recent_logs = db.query(SearchLog).order_by(SearchLog.created_at.desc()).limit(5).all()
+        recent_logs = minio_storage.get_search_logs(limit=5)
         logs_data = []
         for log in recent_logs:
             logs_data.append({
-                "id": str(log.id),
-                "query": log.query,
-                "results_count": log.results_count,
-                "response_time_ms": log.response_time_ms,
-                "created_at": log.created_at.isoformat()
+                "id": log['id'],
+                "query": log['query'],
+                "results_count": log['results_count'],
+                "response_time_ms": log['response_time_ms'],
+                "created_at": log['timestamp']
             })
         
-        db.close()
-        
         return {
-            "database": "PostgreSQL",
+            "database": "MinIO Object Storage",
             "statistics": {
-                "total_videos": video_count,
-                "total_search_logs": log_count
+                "total_videos": stats['videos'],
+                "total_search_logs": stats['search_logs'],
+                "total_segments": stats['segments']
             },
             "recent_videos": videos_data,
             "recent_search_logs": logs_data
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Storage query failed: {str(e)}")
 
 
 @app.get("/check-minio-videos")
 async def check_minio_videos():
     """Check which videos are actually available in MinIO."""
     try:
-        from pipeline.database import get_db_session
-        from pipeline.models import Video
-        
-        db = get_db_session()
-        all_videos = db.query(Video).all()
+        # Get all videos from MinIO storage
+        all_videos = minio_storage.list_videos()
         
         video_status = []
         for video in all_videos:
             try:
                 # Try to get object info from MinIO
-                video_path = f"videos/{video.filename}"
+                video_path = f"videos/{video['filename']}"
                 obj_stat = minio_client.stat_object(bucket_name, video_path)
                 status = "available"
                 minio_size = obj_stat.size
@@ -426,15 +483,14 @@ async def check_minio_videos():
                 minio_size = 0
             
             video_status.append({
-                "id": str(video.id),
-                "filename": video.filename,
-                "db_size": video.file_size_bytes,
+                "id": video['id'],
+                "filename": video['filename'],
+                "db_size": video.get('file_size_bytes', 0),
                 "minio_size": minio_size,
                 "status": status,
-                "minio_path": f"videos/{video.filename}"
+                "minio_path": f"videos/{video['filename']}"
             })
         
-        db.close()
         return {"videos": video_status}
         
     except Exception as e:

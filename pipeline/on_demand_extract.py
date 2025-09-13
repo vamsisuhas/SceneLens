@@ -17,8 +17,6 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline.database import get_db_session
-from pipeline.models import Video, Segment
 from minio import Minio
 
 # Configure logging
@@ -137,8 +135,14 @@ class OnDemandExtractor:
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        # Handle invalid FPS values
+        if fps <= 0 or fps is None:
+            logger.warning(f"Invalid FPS ({fps}), using default 30 FPS")
+            fps = 30.0
+        
         # Calculate frame interval
         frame_interval = max(1, int(fps * interval_seconds))
+        logger.info(f"Video FPS: {fps}, Frame interval: {frame_interval} frames")
         
         frames = []
         frame_number = 0

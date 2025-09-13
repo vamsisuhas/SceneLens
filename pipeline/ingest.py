@@ -11,8 +11,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline.database import get_db_session, init_db
-from pipeline.models import Video
+from pipeline.minio_storage import MinIOStorage
 from minio import Minio
 import tempfile
 
@@ -111,7 +110,7 @@ def ingest_video(video_path, output_dir="data/videos"):
 
 
 def store_video_metadata(filename: str, video_path: str) -> str:
-    """Store video metadata in database - lightweight approach for on-demand processing."""
+    """Store video metadata in MinIO - lightweight approach for on-demand processing."""
     print(f"Storing metadata for video: {filename}")
     
     try:
@@ -119,30 +118,26 @@ def store_video_metadata(filename: str, video_path: str) -> str:
         video_info = get_video_info(video_path)
         print(f"Video info: {video_info}")
         
-        # Store video in database
-        init_db()
-        db = get_db_session()
+        # Initialize MinIO storage
+        minio_client = Minio(
+            "localhost:9000",
+            access_key="scenelens",
+            secret_key="scenelens_dev123",
+            secure=False
+        )
+        minio_storage = MinIOStorage(minio_client, "scenelens")
         
-        try:
-            # Create video record
-            video = Video(
-                filename=filename,
-                title=Path(filename).stem.replace("_", " ").title(),
-                **video_info
-            )
-            db.add(video)
-            db.commit()
-            video_id = video.id
-            print(f"✅ Video metadata stored with ID: {video_id}")
-            print("🔍 Video is ready for on-demand search - no pre-processing needed!")
-            return video_id
-            
-        except Exception as e:
-            db.rollback()
-            print(f"Database error during metadata storage: {e}")
-            return None
-        finally:
-            db.close()
+        # Create video record
+        video_data = {
+            "filename": filename,
+            "title": Path(filename).stem.replace("_", " ").title(),
+            **video_info
+        }
+        
+        video_id = minio_storage.store_video_metadata(video_data)
+        print(f"✅ Video metadata stored with ID: {video_id}")
+        print("🔍 Video is ready for on-demand search - no pre-processing needed!")
+        return video_id
             
     except Exception as e:
         print(f"Error processing video metadata: {e}")
