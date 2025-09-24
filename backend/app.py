@@ -3,8 +3,11 @@
 
 import os
 import logging
+import threading
+import time
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
@@ -13,27 +16,29 @@ from minio.error import S3Error
 
 import sys
 import os
+import subprocess
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backend.search import get_search_engine
+from backend.blip2_search import get_blip2_search_engine
+from minio_storage import MinIOStorage
 from minio import Minio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize MinIO client
+# Initialize MinIO client with explicit region
 minio_client = Minio(
-    "localhost:9000",
+    "127.0.0.1:9000",
     access_key="scenelens",
     secret_key="scenelens_dev123",
-    secure=False
+    secure=False,
+    region="us-east-1"
 )
 
-# Ensure bucket exists
+# Initialize MinIO storage
 bucket_name = "scenelens"
-if not minio_client.bucket_exists(bucket_name):
-    minio_client.make_bucket(bucket_name)
+minio_storage = MinIOStorage(minio_client, bucket_name)
 
 
 # Pydantic models
@@ -59,6 +64,18 @@ class SearchResponse(BaseModel):
     search_type: str
 
 
+class NgrokTunnelRequest(BaseModel):
+    auth_token: str
+    port: int = 8501
+
+
+class NgrokTunnelResponse(BaseModel):
+    status: str
+    url: Optional[str] = None
+    active: bool
+    error: Optional[str] = None
+
+
 # Create FastAPI app
 app = FastAPI(
     title="SceneLens Search API",
@@ -75,66 +92,180 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global ngrok state - support multiple tunnels
+ngrok_threads = {}
+ngrok_status = {
+    "tunnels": {},  # port -> {url, active, error}
+    "active": False,
+    "error": None
+}
+
+
+def validate_mp4_format(video_path: str, original_filename: str) -> bool:
+    """
+    Validate that the video is in proper MP4 format (not M4V or other formats).
+    Returns True if valid MP4, False otherwise.
+    """
+    try:
+        # Check video format using file command
+        result = subprocess.run(['file', video_path], capture_output=True, text=True)
+        file_info = result.stdout.lower()
+        
+        logger.info(f"Video format check for {original_filename}: {file_info}")
+        
+        # Accept standard MP4 format
+        if ('mp4' in file_info or 'iso media' in file_info) and 'm4v' not in file_info:
+            logger.info(f"✅ Video {original_filename} is valid MP4 format: {file_info}")
+            return True
+        else:
+            logger.warning(f"❌ Video {original_filename} is not valid MP4 format: {file_info}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error checking video format: {e}")
+        return False
+
+
+def start_ngrok_tunnel(auth_token: str, port: int):
+    """Start ngrok tunnel in background thread for specific port."""
+    global ngrok_status, ngrok_threads
+    
+    try:
+        import ngrok
+        
+        # Set auth token
+        ngrok.set_auth_token(auth_token)
+        
+        # Start tunnel for specific port
+        listener = ngrok.forward(port)
+        
+        # Update status for this specific port
+        ngrok_status["tunnels"][str(port)] = {
+            "url": listener.url(),
+            "active": True,
+            "error": None
+        }
+        
+        # Update global status
+        ngrok_status["active"] = len(ngrok_status["tunnels"]) > 0
+        ngrok_status["error"] = None
+        
+        logger.info(f"Ngrok tunnel started for port {port}: {listener.url()}")
+        
+        # Keep the listener alive
+        while True:
+            time.sleep(1)
+        
+    except Exception as e:
+        # Update status for this specific port
+        if str(port) in ngrok_status["tunnels"]:
+            ngrok_status["tunnels"][str(port)].update({
+                "active": False,
+                "error": str(e)
+            })
+        else:
+            ngrok_status["tunnels"][str(port)] = {
+                "url": None,
+                "active": False,
+                "error": str(e)
+            }
+        
+        # Update global status
+        ngrok_status["active"] = any(t.get("active", False) for t in ngrok_status["tunnels"].values())
+        
+        logger.error(f"Failed to start ngrok tunnel for port {port}: {e}")
+
+
+def stop_ngrok_tunnel(port: int = None):
+    """Stop ngrok tunnel(s)."""
+    global ngrok_threads, ngrok_status
+    
+    try:
+        import ngrok
+        
+        if port is not None:
+            # Stop specific port tunnel
+            if str(port) in ngrok_status["tunnels"]:
+                del ngrok_status["tunnels"][str(port)]
+                if str(port) in ngrok_threads:
+                    ngrok_threads[str(port)] = None
+                logger.info(f"Ngrok tunnel stopped for port {port}")
+        else:
+            # Stop all tunnels
+            ngrok.disconnect()
+            ngrok_status["tunnels"] = {}
+            ngrok_threads = {}
+            logger.info("All ngrok tunnels stopped")
+        
+        # Update global status
+        ngrok_status["active"] = len(ngrok_status["tunnels"]) > 0
+        
+    except Exception as e:
+        logger.error(f"Failed to stop ngrok tunnel: {e}")
+
 
 @app.get("/")
 async def root():
     """Root endpoint with API information."""
     return {
-        "message": "SceneLens Query-Based Search API",
-        "version": "1.0.0",
+        "message": "SceneLens BLIP-2 Video Search API - Enhanced Accuracy",
+        "version": "2.0.0",
+        "search_engine": "BLIP-2 (Vision-Language Model)",
         "endpoints": {
-            "search": "/search?q=<query>&top_k=<number>",
-            "search_on_demand": "/search/on-demand?q=<query>&top_k=<number>&frame_interval=<seconds>",
-            "database_info": "/database",
+            "search_on_demand": "/search/on-demand?q=<query>&top_k=<number>&frame_interval=<seconds> (BLIP-2)",
+            "search_specific_video": "/search/video/{video_id}?q=<query>&top_k=<number> (BLIP-2)",
+            "legacy_blip2_search": "/search/blip2/{video_id}?q=<query>&top_k=<number>&frame_interval=<seconds>",
+            "get_video_file": "/video/{video_id}/file",
             "upload_video": "/upload-video/",
+            "process_video": "/process-video/",
+            "check_minio_videos": "/check-minio-videos",
+            "database_info": "/database",
             "health": "/health",
             "docs": "/docs",
         }
     }
 
-
-@app.get("/search", response_model=SearchResponse)
-async def search(
-    q: str = Query(..., description="Search query text"),
-    top_k: int = Query(10, description="Number of results to return", ge=1, le=100)
-):
-    """Query-based search endpoint using prompt-driven frame extraction."""
-    try:
-        search_engine = get_search_engine()
-        results = search_engine.search_on_demand(q, top_k)
-        
-        return SearchResponse(
-            query=q,
-            results=[SearchResult(**result) for result in results],
-            total_results=len(results),
-            search_type="query_based"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-
-
 @app.get("/search/on-demand", response_model=SearchResponse)
 async def search_on_demand(
     q: str = Query(..., description="Search query text"),
     top_k: int = Query(10, description="Number of results to return", ge=1, le=50),
-    frame_interval: float = Query(1.0, description="Frame extraction interval in seconds", ge=0.1, le=2.0),
+    frame_interval: float = Query(1.0, description="Frame extraction interval in seconds", ge=0.1),
     use_existing_first: bool = Query(True, description="Search existing keyframes first")
 ):
-    """On-demand search endpoint using dynamic frame extraction."""
+    """On-demand search endpoint using BLIP-2 for better accuracy."""
     try:
-        search_engine = get_search_engine()
-        results = search_engine.search_on_demand(
-            q, top_k, frame_interval, use_existing_first
-        )
+        # Use BLIP-2 search for better accuracy
+        from backend.blip2_search import get_blip2_search_engine
+        blip2_engine = get_blip2_search_engine()
+        
+        # Get all videos and search across them
+        all_videos = blip2_engine.minio_storage.list_videos()
+        all_results = []
+        
+        for video in all_videos:
+            if len(all_results) >= top_k:
+                break
+                
+            video_results = blip2_engine.search_video_with_blip2(
+                video_id=video['id'],
+                query=q,
+                top_k=max((top_k - len(all_results)) * 2, 10),
+                frame_interval=frame_interval
+            )
+            all_results.extend(video_results)
+        
+        # Sort by score and limit to top_k
+        all_results.sort(key=lambda x: x.get('score', 0), reverse=True)
+        all_results = all_results[:top_k]
         
         return SearchResponse(
             query=q,
-            results=[SearchResult(**result) for result in results],
-            total_results=len(results),
-            search_type="on_demand"
+            results=[SearchResult(**result) for result in all_results],
+            total_results=len(all_results),
+            search_type="blip2_on_demand"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"On-demand search failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"BLIP-2 search failed: {str(e)}")
 
 
 @app.get("/search/video/{video_id}", response_model=SearchResponse)
@@ -142,14 +273,45 @@ async def search_specific_video(
     video_id: str,
     q: str = Query(..., description="Search query text"),
     top_k: int = Query(10, description="Number of results to return", ge=1, le=50),
-    frame_interval: float = Query(0.1, description="Frame extraction interval in seconds", ge=0.1, le=2.0)
+    frame_interval: float = Query(0.1, description="Frame extraction interval in seconds", ge=0.1)
 ):
-    """Search within a specific video only."""
+    """Search within a specific video using BLIP-2 for better accuracy."""
     try:
-        search_engine = get_search_engine()
+        # Use BLIP-2 search for better accuracy
+        from backend.blip2_search import get_blip2_search_engine
+        blip2_engine = get_blip2_search_engine()
         
-        # Perform search with video_id filter
-        results = search_engine.search_specific_video(
+        results = blip2_engine.search_video_with_blip2(
+            video_id=video_id,
+            query=q,
+            top_k=top_k,
+            frame_interval=frame_interval
+        )
+        
+        return SearchResponse(
+            query=q,
+            results=results,
+            total_results=len(results),
+            search_type="blip2_video_specific"
+        )
+    except Exception as e:
+        logger.error(f"BLIP-2 video search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"BLIP-2 video search failed: {str(e)}")
+
+
+@app.get("/search/blip2/{video_id}", response_model=SearchResponse)
+async def search_video_with_blip2(
+    video_id: str,
+    q: str = Query(..., description="Search query text"),
+    top_k: int = Query(10, description="Number of results to return", ge=1, le=50),
+    frame_interval: float = Query(0.5, description="Frame extraction interval in seconds", ge=0.1)
+):
+    """Search within a specific video using BLIP-2 for intelligent analysis."""
+    try:
+        blip2_search_engine = get_blip2_search_engine()
+        
+        # Perform BLIP-2 based search
+        results = blip2_search_engine.search_video_with_blip2(
             query=q,
             video_id=video_id,
             top_k=top_k,
@@ -160,116 +322,207 @@ async def search_specific_video(
             query=q,
             results=results,
             total_results=len(results),
-            search_type="video_specific"
+            search_type="blip2_based"
         )
     except Exception as e:
-        logger.error(f"Video-specific search failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Video search failed: {str(e)}")
+        logger.error(f"BLIP-2 search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"BLIP-2 search failed: {str(e)}")
 
 
-@app.get("/video/{video_id}/segments")
-async def get_video_segments(video_id: str):
-    """Get all segments for a video with timeline data."""
+@app.get("/video/{video_id}/url")
+async def get_video_url(video_id: str):
+    """Get presigned URL for video playback - much simpler and more reliable."""
     try:
-        from pipeline.database import get_db_session
-        from pipeline.models import Video, Segment
-        
-        db = get_db_session()
-        video = db.query(Video).filter(Video.id == video_id).first()
+        # Get video metadata from MinIO storage
+        video = minio_storage.get_video_metadata(video_id)
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
         
-        # Get all segments and deduplicate by timestamp
-        all_segments = db.query(Segment).filter(
-            Segment.video_id == video_id
-        ).order_by(Segment.timestamp_seconds).all()
+        # Get video object path in MinIO
+        video_path = f"videos/{video['filename']}"
         
-        # Deduplicate segments by timestamp (keep the first one at each timestamp)
-        unique_segments = []
-        seen_timestamps = set()
-        
-        for segment in all_segments:
-            if segment.timestamp_seconds not in seen_timestamps:
-                unique_segments.append(segment)
-                seen_timestamps.add(segment.timestamp_seconds)
-        
-        logger.info(f"Found {len(all_segments)} total segments, deduplicated to {len(unique_segments)} unique segments")
-        
-        # Calculate segment boundaries
-        video_segments = []
-        for i, segment in enumerate(unique_segments):
-            # Calculate end time (next segment start or video end)
-            if i < len(unique_segments) - 1:
-                segment_end = unique_segments[i + 1].timestamp_seconds
-            else:
-                segment_end = segment.timestamp_seconds + 2.0  # Default duration
+        try:
+            # Check if object exists first
+            logger.info(f"Checking MinIO object: bucket='{bucket_name}', path='{video_path}'")
+            stat = minio_client.stat_object(bucket_name, video_path)
+            file_size = stat.size
+            logger.info(f"Object found: size={file_size} bytes")
             
-            video_segments.append({
-                "segment_id": str(segment.id),
-                "timestamp_seconds": segment.timestamp_seconds,
-                "start_seconds": segment.timestamp_seconds,
-                "end_seconds": segment_end,
-                "duration_seconds": segment_end - segment.timestamp_seconds,
-                "keyframe_path": segment.keyframe_path,
-                "caption": segment.caption,
-                "frame_number": segment.frame_number
-            })
+        except Exception as minio_error:
+            logger.error(f"MinIO stat_object failed for {video_path}: {minio_error}")
+            logger.error(f"Error type: {type(minio_error).__name__}")
+            
+            # Try to list objects to see what's actually there
+            try:
+                objects = list(minio_client.list_objects(bucket_name, prefix="videos/", recursive=True))
+                logger.info(f"Available videos in bucket:")
+                for obj in objects:
+                    logger.info(f"  - {obj.object_name} (size: {obj.size})")
+            except Exception as list_error:
+                logger.error(f"Failed to list bucket contents: {list_error}")
+            
+            raise HTTPException(status_code=404, detail=f"Video file not found in MinIO: {video_path}")
+        
+        # Generate presigned URL (valid for 2 hours)
+        from datetime import timedelta
+        presigned_url = minio_client.presigned_get_object(
+            bucket_name, 
+            video_path, 
+            expires=timedelta(hours=2)
+        )
         
         return {
             "video_id": video_id,
-            "video_filename": video.filename,
-            "video_title": video.title,
-            "duration_seconds": video.duration_seconds,
-            "segments": video_segments,
-            "total_segments": len(video_segments),
-            "original_segments": len(all_segments)
+            "filename": video['filename'],
+            "url": presigned_url,
+            "file_size": file_size,
+            "expires_in_seconds": 7200  # 2 hours
         }
-        
+                
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting video segments: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get video segments: {str(e)}")
-    finally:
-        db.close()
+        logger.error(f"Error getting video URL: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get video URL: {str(e)}")
 
 
 @app.get("/video/{video_id}/file")
-async def get_video_file(video_id: str):
-    """Get video file for playback."""
+@app.head("/video/{video_id}/file")
+async def get_video_file_simple(video_id: str, request: Request):
+    """Download video from MinIO and serve as static file - simplest approach."""
     try:
-        from pipeline.database import get_db_session
-        from pipeline.models import Video
-        from fastapi.responses import StreamingResponse
-        import io
-        
-        db = get_db_session()
-        video = db.query(Video).filter(Video.id == video_id).first()
+        # Get video metadata
+        video = minio_storage.get_video_metadata(video_id)
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
         
+        # Download video from MinIO to temp file
+        temp_path = f"/tmp/video_{video_id}.mp4"
+        video_path = f"videos/{video['filename']}"
+        
+        # For HEAD requests, get file info without downloading
+        if request.method == "HEAD":
+            try:
+                stat = minio_client.stat_object(bucket_name, video_path)
+                return Response(
+                    headers={
+                        "Content-Length": str(stat.size),
+                        "Content-Type": "video/mp4",
+                        "Accept-Ranges": "bytes",
+                        "Access-Control-Allow-Origin": "*"
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Failed to get video stats from MinIO: {e}")
+                raise HTTPException(status_code=404, detail=f"Video not found: {str(e)}")
+        
+        # For GET requests, download and serve the file
         try:
-            # Get video data from MinIO
-            video_data = minio_client.get_object(bucket_name, f"videos/{video.filename}")
-            video_bytes = video_data.read()
-            
-            # Return video as streaming response
-            return StreamingResponse(
-                io.BytesIO(video_bytes),
-                media_type="video/mp4",
-                headers={
-                    "Content-Disposition": f"inline; filename={video.filename}",
-                    "Accept-Ranges": "bytes"
-                }
-            )
-                
+            minio_client.fget_object(bucket_name, video_path, temp_path)
         except Exception as e:
-            logger.error(f"Error serving video file: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to serve video: {str(e)}")
-                    
+            logger.error(f"Failed to download video from MinIO: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to access video: {str(e)}")
+        
+        # Serve as static file
+        return FileResponse(
+            temp_path,
+            media_type="video/mp4",
+            filename=video['filename'],
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Accept-Ranges": "bytes"
+            }
+        )
+                
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting video file: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get video file: {str(e)}")
-    finally:
-        db.close()
+        logger.error(f"Error serving video file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to serve video: {str(e)}")
+
+
+@app.get("/debug/minio/{video_id}")
+async def debug_minio_video(video_id: str):
+    """Debug endpoint to check MinIO video accessibility."""
+    try:
+        # Get video metadata
+        video = minio_storage.get_video_metadata(video_id)
+        if not video:
+            return {"error": "Video not found in database", "video_id": video_id}
+        
+        video_path = f"videos/{video['filename']}"
+        
+        # Check bucket exists
+        try:
+            bucket_exists = minio_client.bucket_exists(bucket_name)
+            if not bucket_exists:
+                return {"error": f"Bucket '{bucket_name}' does not exist"}
+        except Exception as e:
+            return {"error": f"Failed to check bucket: {str(e)}"}
+        
+        # Check object exists
+        try:
+            stat = minio_client.stat_object(bucket_name, video_path)
+            object_info = {
+                "size": stat.size,
+                "last_modified": stat.last_modified.isoformat(),
+                "etag": stat.etag,
+                "content_type": stat.content_type
+            }
+        except Exception as e:
+            # List what's actually in the videos/ folder
+            try:
+                objects = list(minio_client.list_objects(bucket_name, prefix="videos/", recursive=True))
+                available_videos = [{"name": obj.object_name, "size": obj.size} for obj in objects]
+                return {
+                    "error": f"Object not found: {video_path}",
+                    "available_videos": available_videos,
+                    "minio_error": str(e)
+                }
+            except Exception as list_error:
+                return {"error": f"Object not found and failed to list bucket: {str(list_error)}"}
+        
+        # Try to generate presigned URL
+        try:
+            from datetime import timedelta
+            presigned_url = minio_client.presigned_get_object(
+                bucket_name, 
+                video_path, 
+                expires=timedelta(minutes=5)
+            )
+            
+            return {
+                "video_id": video_id,
+                "filename": video['filename'],
+                "video_path": video_path,
+                "bucket": bucket_name,
+                "object_info": object_info,
+                "presigned_url": presigned_url,
+                "status": "success"
+            }
+            
+        except Exception as e:
+            return {
+                "error": f"Failed to generate presigned URL: {str(e)}",
+                "video_path": video_path,
+                "object_info": object_info
+            }
+            
+    except Exception as e:
+        return {"error": f"Debug failed: {str(e)}", "video_id": video_id}
+
+
+@app.options("/video/{video_id}/file")
+async def options_video_file(video_id: str):
+    """Handle CORS preflight requests for video files."""
+    return Response(
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type, Accept-Encoding",
+            "Access-Control-Max-Age": "86400"
+        }
+    )
 
 
 @app.get("/image/{path:path}")
@@ -278,8 +531,8 @@ async def get_image(path: str):
     try:
         
         # Security: ensure path is within allowed directories or contains frames
-        allowed_dirs = ["data/frames", "frames", "artifacts"]
-        if not any(path.startswith(d) for d in allowed_dirs) and "frames/" not in path and "query_extracted/" not in path:
+        allowed_dirs = ["data/frames", "frames", "artifacts", "blip2"]
+        if not any(path.startswith(d) for d in allowed_dirs) and "frames/" not in path and "query_extracted/" not in path and "blip2/" not in path:
             raise HTTPException(status_code=403, detail="Access denied")
         
         # Try to get image from MinIO first
@@ -297,6 +550,21 @@ async def get_image(path: str):
                 if len(path_parts) >= 3 and path_parts[1] == path_parts[2]:
                     # Remove duplicate folder: frames/video_name/video_name/file.jpg -> frames/video_name/file.jpg
                     minio_path = '/'.join([path_parts[0]] + path_parts[2:])
+            elif "blip2/" in path:
+                # Legacy support for old BLIP2 paths like "blip2/military.mp4/0"
+                # These should now be proper MinIO paths, but keep this for backward compatibility
+                blip2_parts = path.split('/')
+                if len(blip2_parts) >= 3:
+                    video_filename = blip2_parts[1]  # e.g., "military.mp4"
+                    frame_number = int(blip2_parts[2])  # e.g., 0
+                    video_stem = Path(video_filename).stem
+                    # Try to find the actual BLIP2 frame in MinIO
+                    # Look for frames in blip2_extracted directory
+                    minio_path = f"frames/{video_stem}/blip2_extracted/frame_{frame_number:06d}_t*_blip2.jpg"
+                    # For now, use a simple fallback format
+                    minio_path = f"frames/{video_stem}/blip2_extracted/frame_{frame_number:06d}.jpg"
+                else:
+                    raise HTTPException(status_code=400, detail="Invalid BLIP2 path format")
             else:
                 # Convert local path to MinIO object path
                 # e.g., "data/frames/demo/frame_000000_t0.00s.jpg" -> "frames/demo/frame_000000_t0.00s.jpg"
@@ -328,20 +596,42 @@ async def get_image(path: str):
 
 @app.post("/upload-video/")
 async def upload_video(file: UploadFile = File(...)):
-    """Endpoint to upload video to MinIO."""
+    """Endpoint to upload video to MinIO with MP4 format validation."""
     try:
+        # Check file extension first
+        if not file.filename.lower().endswith('.mp4'):
+            raise HTTPException(
+                status_code=400, 
+                detail="Only MP4 files are supported. Please convert your video to MP4 format before uploading."
+            )
+        
         # Save uploaded file temporarily
-        file_location = f"/tmp/{file.filename}"
-        with open(file_location, "wb") as f:
+        temp_path = f"/tmp/{file.filename}"
+        with open(temp_path, "wb") as f:
             f.write(await file.read())
 
-        # Upload to MinIO
-        minio_client.fput_object(bucket_name, f"videos/{file.filename}", file_location)
+        # Validate that it's actually a proper MP4 file (not M4V or other formats)
+        if not validate_mp4_format(temp_path, file.filename):
+            os.remove(temp_path)  # Clean up temp file
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid video format. Please upload a standard MP4 file (not M4V, AVI, or other formats). "
+                       "You can convert your video using online converters or tools like FFmpeg."
+            )
+
+        # Upload to MinIO with correct content-type
+        minio_client.fput_object(bucket_name, f"videos/{file.filename}", temp_path, content_type="video/mp4")
         
         # Clean up temp file
-        os.remove(file_location)
+        os.remove(temp_path)
         
-        return {"message": f"Uploaded {file.filename} to MinIO.", "filename": file.filename}
+        return {
+            "message": f"Successfully uploaded {file.filename}",
+            "filename": file.filename,
+            "format": "MP4 (validated)"
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error uploading video: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
@@ -349,20 +639,11 @@ async def upload_video(file: UploadFile = File(...)):
 
 @app.post("/process-video/")
 async def process_video(request: dict):
-    """Ultra-lightweight video processing - just store basic metadata."""
+    """Process video and store complete metadata."""
     try:
         filename = request.get("filename")
         if not filename:
             raise HTTPException(status_code=400, detail="Filename is required")
-        
-        # Import database functions
-        import sys
-        import os
-        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        
-        from pipeline.database import get_db_session
-        from pipeline.models import Video
-        from datetime import datetime
         
         logger.info(f"Storing video metadata: {filename}")
         
@@ -374,34 +655,52 @@ async def process_video(request: dict):
             obj_stat = minio_client.stat_object(bucket_name, video_path)
             file_size = obj_stat.size
             
-            # Store in database with minimal metadata
-            db = get_db_session()
-            
             # Check if video already exists
-            existing_video = db.query(Video).filter(Video.filename == filename).first()
+            existing_videos = minio_storage.list_videos()
+            existing_video = next((v for v in existing_videos if v.get('filename') == filename), None)
+            
             if existing_video:
-                video_id = existing_video.id
+                video_id = existing_video['id']
                 logger.info(f"Video already exists with ID: {video_id}")
             else:
-                # Create new video record with basic info
-                video = Video(
-                    filename=filename,
-                    title=filename.split('.')[0],  # Use filename without extension as title
-                    duration_seconds=0,  # Will be determined during search
-                    fps=0,  # Will be determined during search
-                    width=0,  # Will be determined during search
-                    height=0,  # Will be determined during search
-                    file_size_bytes=file_size,
-                    created_at=datetime.utcnow(),
-                    minio_path=video_path
-                )
+                # Download video temporarily to extract complete metadata
+                import tempfile
+                import cv2
+                from pathlib import Path
                 
-                db.add(video)
-                db.commit()
-                video_id = video.id
-                logger.info(f"Created new video record with ID: {video_id}")
-            
-            db.close()
+                with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
+                    minio_client.fget_object(bucket_name, video_path, temp_file.name)
+                    temp_video_path = temp_file.name
+                
+                try:
+                    # Extract complete video metadata
+                    cap = cv2.VideoCapture(temp_video_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    duration = frame_count / fps if fps > 0 else 0
+                    cap.release()
+                    
+                    # Create video record with complete metadata
+                    video_data = {
+                        "filename": filename,
+                        "title": Path(filename).stem.replace("_", " ").title(),
+                        "duration_seconds": duration,
+                        "fps": fps,
+                        "width": width,
+                        "height": height,
+                        "file_size_bytes": file_size
+                    }
+                    
+                    video_id = minio_storage.store_video_metadata(video_data)
+                    logger.info(f"Created new video record with ID: {video_id}")
+                    
+                finally:
+                    # Clean up temp file
+                    import os
+                    if os.path.exists(temp_video_path):
+                        os.unlink(temp_video_path)
             
             return {
                 "message": f"Video {filename} uploaded successfully!",
@@ -409,7 +708,7 @@ async def process_video(request: dict):
                 "filename": filename,
                 "file_size": file_size,
                 "status": "ready_for_search",
-                "note": "Video stored - processing will happen on first search"
+                "note": "Video stored with complete metadata - ready for search"
             }
             
         except Exception as e:
@@ -424,30 +723,83 @@ async def process_video(request: dict):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    search_engine = get_search_engine()
-    return {
-        "status": "healthy",
-        "text_encoder_loaded": search_engine.text_encoder is not None,
-        "on_demand_extractor_loaded": search_engine.on_demand_extractor is not None,
-        "search_type": "prompt_driven"
-    }
+    try:
+        blip2_engine = get_blip2_search_engine()
+        return {
+            "status": "healthy",
+            "blip2_model_loaded": blip2_engine.blip2_model is not None,
+            "minio_storage_connected": blip2_engine.minio_storage is not None,
+            "search_type": "blip2_vlm"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "search_type": "blip2_vlm"
+        }
+
+@app.get("/database")
+async def get_database_info():
+    """Get MinIO storage information and statistics."""
+    try:
+        # Get statistics from MinIO storage
+        stats = minio_storage.get_database_stats()
+        
+        # Get recent videos
+        all_videos = minio_storage.list_videos()
+        recent_videos = all_videos[:5]  # Get first 5 (already sorted by date)
+        videos_data = []
+        for video in recent_videos:
+            videos_data.append({
+                "id": video['id'],
+                "filename": video['filename'],
+                "title": video.get('title', ''),
+                "duration_seconds": video.get('duration_seconds', 0),
+                "fps": video.get('fps', 0),
+                "resolution": f"{video.get('width', 0)}x{video.get('height', 0)}",
+                "file_size_bytes": video.get('file_size_bytes', 0),
+                "created_at": video.get('created_at', '')
+            })
+        
+        # Get recent search logs
+        recent_logs = minio_storage.get_search_logs(limit=5)
+        logs_data = []
+        for log in recent_logs:
+            logs_data.append({
+                "id": log['id'],
+                "query": log['query'],
+                "results_count": log['results_count'],
+                "response_time_ms": log['response_time_ms'],
+                "created_at": log['timestamp']
+            })
+        
+        return {
+            "database": "MinIO Object Storage",
+            "statistics": {
+                "total_videos": stats['videos'],
+                "total_search_logs": stats['search_logs'],
+                "total_segments": stats['segments']
+            },
+            "recent_videos": videos_data,
+            "recent_search_logs": logs_data
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Storage query failed: {str(e)}")
 
 
 @app.get("/check-minio-videos")
 async def check_minio_videos():
     """Check which videos are actually available in MinIO."""
     try:
-        from pipeline.database import get_db_session
-        from pipeline.models import Video
-        
-        db = get_db_session()
-        all_videos = db.query(Video).all()
+        # Get all videos from MinIO storage
+        all_videos = minio_storage.list_videos()
         
         video_status = []
         for video in all_videos:
             try:
                 # Try to get object info from MinIO
-                video_path = f"videos/{video.filename}"
+                video_path = f"videos/{video['filename']}"
                 obj_stat = minio_client.stat_object(bucket_name, video_path)
                 status = "available"
                 minio_size = obj_stat.size
@@ -456,15 +808,14 @@ async def check_minio_videos():
                 minio_size = 0
             
             video_status.append({
-                "id": str(video.id),
-                "filename": video.filename,
-                "db_size": video.file_size_bytes,
+                "id": video['id'],
+                "filename": video['filename'],
+                "db_size": video.get('file_size_bytes', 0),
                 "minio_size": minio_size,
                 "status": status,
-                "minio_path": f"videos/{video.filename}"
+                "minio_path": f"videos/{video['filename']}"
             })
         
-        db.close()
         return {"videos": video_status}
         
     except Exception as e:
@@ -472,98 +823,94 @@ async def check_minio_videos():
         raise HTTPException(status_code=500, detail=f"Failed to check videos: {str(e)}")
 
 
-@app.get("/database")
-async def get_database_info():
-    """Get PostgreSQL database information and statistics."""
+@app.post("/ngrok/start", response_model=NgrokTunnelResponse)
+async def start_ngrok(request: NgrokTunnelRequest):
+    """Start ngrok tunnel for specified port."""
+    global ngrok_threads, ngrok_status
+    
     try:
-        from pipeline.database import get_db_session
-        from pipeline.models import Video, Segment, SearchLog
+        port_str = str(request.port)
         
-        db = get_db_session()
+        # Check if tunnel is already active for this port
+        if port_str in ngrok_status["tunnels"] and ngrok_status["tunnels"][port_str]["active"]:
+            return NgrokTunnelResponse(
+                status="already_active",
+                url=ngrok_status["tunnels"][port_str]["url"],
+                active=True,
+                error=f"Tunnel for port {request.port} is already running"
+            )
         
-        # Get counts
-        video_count = db.query(Video).count()
-        segment_count = db.query(Segment).count()
-        log_count = db.query(SearchLog).count()
+        # Start tunnel in background thread
+        thread = threading.Thread(
+            target=start_ngrok_tunnel,
+            args=(request.auth_token, request.port),
+            daemon=True
+        )
+        thread.start()
+        ngrok_threads[port_str] = thread
         
-        # Get recent videos
-        recent_videos = db.query(Video).order_by(Video.created_at.desc()).limit(5).all()
-        videos_data = []
-        for video in recent_videos:
-            videos_data.append({
-                "id": str(video.id),
-                "filename": video.filename,
-                "title": video.title,
-                "duration_seconds": video.duration_seconds,
-                "fps": video.fps,
-                "resolution": f"{video.width}x{video.height}",
-                "file_size_bytes": video.file_size_bytes,
-                "created_at": video.created_at.isoformat()
-            })
+        # Wait a moment for tunnel to initialize
+        time.sleep(3)
         
-        # Get recent segments
-        recent_segments = db.query(Segment).order_by(Segment.created_at.desc()).limit(5).all()
-        segments_data = []
-        for segment in recent_segments:
-            segments_data.append({
-                "id": str(segment.id),
-                "video_id": str(segment.video_id),
-                "frame_number": segment.frame_number,
-                "timestamp_seconds": segment.timestamp_seconds,
-                "keyframe_path": segment.keyframe_path,
-                "caption": segment.caption,
-                "created_at": segment.created_at.isoformat()
-            })
+        # Get the URL for this specific port
+        tunnel_url = ngrok_status["tunnels"].get(port_str, {}).get("url")
         
-        # Get recent search logs
-        recent_logs = db.query(SearchLog).order_by(SearchLog.created_at.desc()).limit(5).all()
-        logs_data = []
-        for log in recent_logs:
-            logs_data.append({
-                "id": str(log.id),
-                "query": log.query,
-                "results_count": log.results_count,
-                "response_time_ms": log.response_time_ms,
-                "created_at": log.created_at.isoformat()
-            })
+        return NgrokTunnelResponse(
+            status="started",
+            url=tunnel_url,
+            active=ngrok_status["active"],
+            error=ngrok_status.get("error")
+        )
         
-        db.close()
+    except Exception as e:
+        logger.error(f"Failed to start ngrok tunnel: {e}")
+        return NgrokTunnelResponse(
+            status="error",
+            active=False,
+            error=str(e)
+        )
+
+
+@app.post("/ngrok/stop")
+async def stop_ngrok(port: int = None):
+    """Stop ngrok tunnel(s)."""
+    global ngrok_threads, ngrok_status
+    
+    try:
+        stop_ngrok_tunnel(port)
         
+        if port is not None:
+            return {
+                "status": "stopped",
+                "port": port,
+                "active_tunnels": len(ngrok_status["tunnels"]),
+                "error": None
+            }
+        else:
+            return {
+                "status": "stopped_all",
+                "active_tunnels": 0,
+                "error": None
+            }
+        
+    except Exception as e:
+        logger.error(f"Failed to stop ngrok tunnel: {e}")
         return {
-            "database": "PostgreSQL",
-            "statistics": {
-                "total_videos": video_count,
-                "total_segments": segment_count,
-                "total_search_logs": log_count
-            },
-            "recent_videos": videos_data,
-            "recent_segments": segments_data,
-            "recent_search_logs": logs_data
+            "status": "error",
+            "error": str(e)
         }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database query failed: {str(e)}")
-
-def upload_image_to_minio(file_path, object_name):
-    """Uploads an image to MinIO."""
-    try:
-        minio_client.fput_object(
-            bucket_name, object_name, file_path
-        )
-        logger.info(f"Image {object_name} uploaded successfully.")
-    except Exception as e:
-        logger.error(f"Error uploading image: {e}")
 
 
-def get_image_from_minio(object_name, download_path):
-    """Retrieves an image from MinIO and saves it to the specified path."""
-    try:
-        minio_client.fget_object(
-            bucket_name, object_name, download_path
-        )
-        logger.info(f"Image {object_name} downloaded successfully to {download_path}.")
-    except Exception as e:
-        logger.error(f"Error downloading image: {e}")
+@app.get("/ngrok/status")
+async def get_ngrok_status():
+    """Get current ngrok tunnel status."""
+    return {
+        "status": "active" if ngrok_status["active"] else "inactive",
+        "tunnels": ngrok_status["tunnels"],
+        "active": ngrok_status["active"],
+        "error": ngrok_status.get("error")
+    }
+
 
 def main():
     """Main entry point for running the server."""
@@ -571,10 +918,9 @@ def main():
         "backend.app:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=False,  # Disable reload to avoid MinIO directory issues
         log_level="info"
     )
-
 
 if __name__ == "__main__":
     main()
