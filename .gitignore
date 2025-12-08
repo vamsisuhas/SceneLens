@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Project specific - Local data (now stored in MinIO)
+data/
+artifacts/
+keyframes/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Model downloads (cached by transformers)
+models/
+checkpoints/
+
+# Database (using PostgreSQL, not SQLite)
+*.db
+*.sqlite3
+
+# MinIO data (Docker volumes)
+minio-data/
+
+# FAISS index files (can be regenerated)
+faiss/*.index
+faiss/*.faiss
+
+# Pipeline temporary files
+/tmp/
+temp/
